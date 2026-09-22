@@ -1,0 +1,32 @@
+# python和venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# pyins
+build/
+dist/
+*.spec
+
+# msu2数据
+config.json
+config.*.json
+todo.md
+screenshots/
+assets/gif/*.jpg
+assets/gif/*.png
+assets/gif/*.gif
+
+# ide
+.vscode/
+.idea/
+*.swp
+
+# other
+.DS_Store
+Thumbs.db
