@@ -34,6 +34,7 @@ class Widget:
     priority = 50
     config_schema: list = []
     actions: dict = {}
+    touch_help = ""
 
     def setup(self, ctx: RenderContext):
         pass
@@ -61,132 +62,103 @@ class Widget:
     def on_action(self, action: str, payload: dict, ctx: RenderContext) -> dict:
         return {"ok": False, "err": f"未实现动作: {action}"}
 
+if getattr(sys, "frozen", False):
+    _APP_DIR = Path(os.path.dirname(os.path.abspath(sys.executable)))
+else:
+    _APP_DIR = Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+_RES_DIR = Path(getattr(sys, "_MEIPASS", str(_APP_DIR)))
+FONT_REGULAR = "NotoSansMonoCJKsc-Regular.otf"
+FONT_BOLD = "NotoSansMonoCJKsc-Bold.otf"
+
 _FONT_CACHE: dict = {}
 _FONT_PATH_CACHE: dict = {}
 _USER_FONT_PATH = None
+_FONT_WARNED = False
+
+def _resolve_font_path(name):
+    if not name:
+        return None
+    if name in _FONT_PATH_CACHE:
+        return _FONT_PATH_CACHE[name]
+    result = None
+    try:
+        p = Path(name)
+        if p.is_absolute():
+            if p.is_file():
+                result = str(p)
+        else:
+            for root in _font_roots():
+                cand = root / name
+                if cand.is_file():
+                    result = str(cand)
+                    break
+    except (OSError, ValueError):
+        result = None
+    _FONT_PATH_CACHE[name] = result
+    return result
 
 def set_user_font(path_or_name: str):
     global _USER_FONT_PATH
     p = _resolve_font_path(path_or_name)
+    _FONT_CACHE.clear()
     if p:
         _USER_FONT_PATH = p
-        _FONT_CACHE.clear()
         log.info("用户指定字体: %s", p)
     else:
-        log.warning("用户指定字体未找到: %s", path_or_name)
+        _USER_FONT_PATH = None
+        if path_or_name:
+            log.warning("用户指定字体未找到: %s", path_or_name)
 
-def _font_dirs():
-    dirs = []
-    if sys.platform == "win32":
-        win = os.environ.get("WINDIR", r"C:\Windows")
-        dirs.append(Path(win) / "Fonts")
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
-    elif sys.platform == "darwin":
-        dirs += [Path("/System/Library/Fonts"), Path("/Library/Fonts"),
-                 Path.home() / "Library/Fonts"]
-    else:
-        dirs += [Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
-                 Path.home() / ".fonts",
-                 Path.home() / ".local/share/fonts"]
-    return [d for d in dirs if d.exists()]
+def _font_roots():
+    roots = []
+    for base in (_RES_DIR, _APP_DIR):
+        p = base / "assets" / "fonts"
+        if p not in roots:
+            roots.append(p)
+    return roots
 
-_CJK_FONTS = [
-    "msyh.ttc", "msyhbd.ttc", "msyhl.ttc",
-    "simhei.ttf", "simsun.ttc", "Deng.ttf", "Dengb.ttf",
-    "SourceHanSansSC-Regular.otf",
-    "PingFang.ttc", "Hiragino Sans GB.ttc",
-    "STHeiti Medium.ttc", "Songti.ttc",
-    "NotoSansCJK-Regular.ttc", "NotoSansCJKsc-Regular.otf",
-    "NotoSansSC-Regular.otf", "SourceHanSansCN-Regular.otf",
-    "wqy-zenhei.ttc", "wqy-microhei.ttc",
-    "DroidSansFallbackFull.ttf",
-]
-
-_LATIN_FONTS = [
-    "DejaVuSansMono-Bold.ttf", "DejaVuSansMono.ttf",
-    "consolab.ttf", "consola.ttf",
-    "Menlo-Bold.ttf", "Menlo.ttc",
-    "arialbd.ttf", "arial.ttf",
-]
-
-def _resolve_font_path(name: str):
-    if name in _FONT_PATH_CACHE:
-        return _FONT_PATH_CACHE[name]
-    if os.path.isabs(name) and os.path.exists(name):
-        _FONT_PATH_CACHE[name] = name
-        return name
-    result = None
-    for d in _font_dirs():
-        p = d / name
-        if p.exists():
-            result = str(p); break
-        for pat in (f"*/{name}", f"*/*/{name}"):
-            try:
-                hit = next(d.glob(pat), None)
-                if hit:
-                    result = str(hit); break
-            except Exception:
-                pass
-        if result:
-            break
-    _FONT_PATH_CACHE[name] = result
-    return result
-
-def _try_load(name: str, size: int):
-    path = _resolve_font_path(name)
-    if not path:
-        return None
-    try:
-        return ImageFont.truetype(path, size)
-    except Exception:
-        return None
+def _bundled_font(bold: bool):
+    names = [FONT_BOLD, FONT_REGULAR] if bold else [FONT_REGULAR]
+    for root in _font_roots():
+        for name in names:
+            p = root / name
+            if p.is_file():
+                return str(p)
+    return None
 
 def get_font(size: int, bold: bool = False, cjk: bool = True):
-    key = (size, bold, cjk)
-    if key in _FONT_CACHE:
-        return _FONT_CACHE[key]
-    if _USER_FONT_PATH:
+    try:
+        size = max(6, int(size))
+    except (TypeError, ValueError):
+        size = 12
+    bold = bool(bold)
+    key = (size, bold)
+    f = _FONT_CACHE.get(key)
+    if f is not None:
+        return f
+    path = _USER_FONT_PATH or _bundled_font(bold)
+    if path:
         try:
-            f = ImageFont.truetype(_USER_FONT_PATH, size)
+            f = ImageFont.truetype(path, size)
             _FONT_CACHE[key] = f
             return f
         except Exception:
-            pass
-    candidates = []
-    if cjk:
-        if bold:
-            candidates += ["msyhbd.ttc", "simhei.ttf",
-                           "NotoSansCJK-Bold.ttc", "NotoSansCJKsc-Bold.otf"]
-        candidates += _CJK_FONTS + _LATIN_FONTS
-    else:
-        if bold:
-            candidates += [n for n in _LATIN_FONTS if "Bold" in n or "bd" in n]
-        candidates += _LATIN_FONTS + _CJK_FONTS
-    seen = set(); uniq = []
-    for n in candidates:
-        if n not in seen:
-            seen.add(n); uniq.append(n)
-    for name in uniq:
-        f = _try_load(name, size)
-        if f is not None:
-            _FONT_CACHE[key] = f
-            return f
-    log.warning("未找到可用的 TrueType 字体，中文将显示为方块")
+            log.warning("字体加载失败: %s", path)
+    global _FONT_WARNED
+    if not _FONT_WARNED:
+        _FONT_WARNED = True
+        log.warning("未找到内置字体 %s，中文将显示为方块", _font_roots())
     f = ImageFont.load_default()
     _FONT_CACHE[key] = f
     return f
 
 def probe_fonts():
-    info = {"font_dirs": [str(d) for d in _font_dirs()],
-            "cjk": None, "latin": None}
-    for name in _CJK_FONTS:
-        p = _resolve_font_path(name)
-        if p:
-            info["cjk"] = {"name": name, "path": p}; break
-    for name in _LATIN_FONTS:
-        p = _resolve_font_path(name)
-        if p:
-            info["latin"] = {"name": name, "path": p}; break
+    info = {"font_dirs": [str(p) for p in _font_roots()], "cjk": None, "latin": None}
+    p = _bundled_font(False)
+    if p:
+        info["cjk"] = {"name": FONT_REGULAR, "path": p}
+    p = _bundled_font(True)
+    if p:
+        info["latin"] = {"name": FONT_BOLD, "path": p}
     return info
