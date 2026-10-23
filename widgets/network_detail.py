@@ -1,6 +1,8 @@
+import locale
 import re
 import subprocess
 import sys
+import threading
 import time
 import psutil
 from PIL import Image, ImageDraw
@@ -52,33 +54,94 @@ def _clip(text, font, max_w):
         out += ch
     return out + ell
 
-def _wifi_signal(iface):
+def _decode_out(raw):
 
-    if not iface:
-        return None
+    if not raw:
+        return ""
+    encs = []
+    try:
+        encs.append(locale.getpreferredencoding(False))
+    except Exception:
+        pass
+    encs.extend(["cp936", "utf-8", "latin-1"])
+    for enc in encs:
+        if not enc:
+            continue
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "ignore")
+
+def _probe_wifi():
+
+    out = {}
     try:
         if sys.platform == "win32":
             cf = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-            out = subprocess.check_output(
+            raw = subprocess.check_output(
                 ["netsh", "wlan", "show", "interfaces"],
-                timeout=2, creationflags=cf,
-            ).decode("utf-8", "ignore")
-            for line in out.splitlines():
-                if "信号" in line or "Signal" in line:
-                    m = re.search(r"(\d+)\s*%", line)
-                    if m:
-                        return int(m.group(1))
+                timeout=2, creationflags=cf, stderr=subprocess.DEVNULL,
+            )
+            name = ""
+            for line in _decode_out(raw).splitlines():
+                m = re.search(r"(?:名称|Name)\s*:\s*(.+)$", line)
+                if m:
+                    name = m.group(1).strip()
+                m = re.search(r"(?:信号|Signal)\s*:\s*(\d+)\s*%", line)
+                if m:
+                    pct = max(0, min(100, int(m.group(1))))
+                    out[name or "wlan"] = pct
         elif sys.platform.startswith("linux"):
             with open("/proc/net/wireless", "r") as f:
                 for line in f:
-                    if iface in line:
-                        parts = line.replace(":", " ").split()
-                        if len(parts) >= 3:
-                            quality = float(parts[2].rstrip("."))
-                            return min(100, int(quality / 70 * 100))
+                    if ":" not in line:
+                        continue
+                    parts = line.replace(":", " ").split()
+                    if len(parts) < 3:
+                        continue
+                    try:
+                        quality = float(parts[2].rstrip("."))
+                    except (TypeError, ValueError):
+                        continue
+                    out[parts[0]] = max(0, min(100, int(quality / 70 * 100)))
     except Exception:
         pass
-    return None
+    return out
+
+class _WifiSource:
+    def __init__(self, interval=3.0):
+        self._interval = max(1.0, float(interval))
+        self._lock = threading.Lock()
+        self._data = {}
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="WifiSource")
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+    def get(self):
+        with self._lock:
+            return dict(self._data)
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                data = _probe_wifi()
+            except Exception:
+                data = {}
+            with self._lock:
+                self._data = data
+            self._stop.wait(self._interval)
 
 @register
 class NetworkDetailWidget(Widget):
@@ -96,67 +159,129 @@ class NetworkDetailWidget(Widget):
     ]
 
     def setup(self, ctx):
+        old = ctx.state.get("_net")
+        if isinstance(old, dict) and old.get("wifi") is not None:
+            try:
+                old["wifi"].stop()
+            except Exception:
+                pass
+        src = _WifiSource(3.0)
+        src.start()
         ctx.state["_net"] = {
             "last": None,
             "t": time.time(),
             "down": 0.0,
             "up": 0.0,
+            "wifi": src,
+            "last_key": None,
         }
+
+    def teardown(self, ctx):
+        st = ctx.state.get("_net")
+        if isinstance(st, dict) and st.get("wifi") is not None:
+            try:
+                st["wifi"].stop()
+            except Exception:
+                pass
+            st["wifi"] = None
+
+    def on_enter(self, ctx):
+        st = ctx.state.get("_net")
+        if isinstance(st, dict):
+            st["last_key"] = None
 
     def render(self, ctx):
         cfg = self.get_config(ctx)
-        iface = (cfg.get("interface") or "").strip()
+        iface = str(cfg.get("interface") or "").strip()
         show_wifi = bool(cfg.get("show_wifi", True))
 
-        st = ctx.state.setdefault("_net", {
-            "last": None, "t": time.time(), "down": 0.0, "up": 0.0,
-        })
+        st = ctx.state.get("_net")
+        if not isinstance(st, dict):
+            st = {"last": None, "t": time.time(), "down": 0.0, "up": 0.0,
+                  "wifi": None, "last_key": None}
+            ctx.state["_net"] = st
+        src = st.get("wifi")
+        if src is None:
+            try:
+                src = _WifiSource(3.0)
+                src.start()
+                st["wifi"] = src
+            except Exception:
+                src = None
 
         now = time.time()
         try:
-            counters = psutil.net_io_counters(pernic=True)
+            counters = psutil.net_io_counters(pernic=True) or {}
         except Exception:
             counters = {}
 
+        io = None
         if iface:
             io = counters.get(iface)
         else:
-            total_recv = sum(c.bytes_recv for n, c in counters.items()
-                             if not n.startswith("lo"))
-            total_sent = sum(c.bytes_sent for n, c in counters.items()
-                             if not n.startswith("lo"))
+            total_recv = 0
+            total_sent = 0
+            for n, c in counters.items():
+                if n.startswith("lo"):
+                    continue
+                total_recv += int(getattr(c, "bytes_recv", 0) or 0)
+                total_sent += int(getattr(c, "bytes_sent", 0) or 0)
             class _Fake:
                 pass
             io = _Fake()
             io.bytes_recv = total_recv
             io.bytes_sent = total_sent
 
-        if io and st["last"]:
-            dt = max(0.001, now - st["t"])
+        if io is not None and st.get("last") is not None:
+            dt = max(0.001, now - float(st.get("t") or now))
             st["down"] = max(0.0, (io.bytes_recv - st["last"].bytes_recv)
                              / dt / 1024)
             st["up"] = max(0.0, (io.bytes_sent - st["last"].bytes_sent)
                            / dt / 1024)
-        st["last"] = io
+        if io is not None:
+            st["last"] = io
         st["t"] = now
 
         if iface and iface not in counters:
+            key = (ctx.orientation, "err", iface)
+            if st.get("last_key") == key:
+                return None
+            st["last_key"] = key
             return self._draw_error(ctx, iface)
+
+        title = iface if iface else "ALL"
+        wifi_pct = None
+        if show_wifi and src is not None:
+            try:
+                data = src.get()
+            except Exception:
+                data = {}
+            if iface:
+                wifi_pct = data.get(iface)
+            else:
+                for pct in data.values():
+                    wifi_pct = pct
+                    break
+
+        down = float(st.get("down") or 0.0)
+        up = float(st.get("up") or 0.0)
+        key = (ctx.orientation, title, _fmt_short(up), _fmt_short(down),
+               ("off",) if not show_wifi else wifi_pct)
+        if st.get("last_key") == key:
+            return None
+        st["last_key"] = key
 
         W, H = ctx.size
         img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
 
-        title = iface if iface else "ALL"
-        wifi_pct = _wifi_signal(iface) if (iface and show_wifi) else None
-
         if ctx.orientation == LANDSCAPE:
-            self._draw_landscape(d, W, H, title, st["down"], st["up"], wifi_pct)
+            self._draw_landscape(d, W, H, title, down, up, wifi_pct, show_wifi)
         else:
-            self._draw_portrait(d, W, H, title, st["down"], st["up"], wifi_pct)
+            self._draw_portrait(d, W, H, title, down, up, wifi_pct, show_wifi)
         return img
 
-    def _draw_landscape(self, d, W, H, title, down, up, wifi_pct):
+    def _draw_landscape(self, d, W, H, title, down, up, wifi_pct, show_wifi):
         f_title = get_font(11, cjk=True)
         f_lbl = get_font(9, cjk=False)
         f_val = get_font(18, bold=True, cjk=False)
@@ -172,10 +297,10 @@ class NetworkDetailWidget(Widget):
         d.text((W // 2 - 6, 50), _fmt_short(down),
                fill="#22cc66", font=f_val, anchor="ra")
 
-        if wifi_pct is not None:
+        if show_wifi:
             self._draw_wifi(d, W // 2 + 4, 20, W // 2 - 8, H - 40, wifi_pct)
 
-    def _draw_portrait(self, d, W, H, title, down, up, wifi_pct):
+    def _draw_portrait(self, d, W, H, title, down, up, wifi_pct, show_wifi):
         f_title = get_font(12, cjk=True)
         f_lbl = get_font(11, cjk=False)
         f_val = get_font(14, bold=True, cjk=False)
@@ -192,18 +317,23 @@ class NetworkDetailWidget(Widget):
         d.text((W - 6, 68), _fmt_short(down),
                fill="#22cc66", font=f_val, anchor="rt")
 
-        if wifi_pct is not None:
+        if show_wifi:
             self._draw_wifi(d, 8, 104, W - 16, 46, wifi_pct)
 
     def _draw_wifi(self, d, x, y, w, h, pct):
 
         f = get_font(10, cjk=False)
-        d.text((x, y), f"WiFi {pct}%", fill="#a0a0a0", font=f)
+        n_bars = 4
+        if pct is None:
+            d.text((x, y), "WiFi --", fill="#6a6a6a", font=f)
+            lit = 0
+        else:
+            pct = max(0, min(100, int(pct)))
+            d.text((x, y), f"WiFi {pct}%", fill="#a0a0a0", font=f)
+            lit = int(pct / 100 * n_bars + 0.999)
 
         bar_y = y + 16
-        bar_h = h - 20
-        n_bars = 4
-        lit = int(pct / 100 * n_bars + 0.999)
+        bar_h = max(4, h - 20)
         gap = 2
         bw = max(2, (w - (n_bars - 1) * gap) // n_bars)
         for i in range(n_bars):

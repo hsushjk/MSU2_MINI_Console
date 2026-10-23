@@ -1,10 +1,37 @@
+import logging
 import shutil
 import subprocess
 import sys
 import threading
-import time
 from PIL import Image, ImageDraw
 from msu2_core import Widget, register, BOTH, LANDSCAPE, Field, get_font
+from ._util import row_text, text_w
+
+log = logging.getLogger("msu2.widgets.clipboard")
+
+
+def _int_or(value, default, lo, hi):
+    try:
+        return max(lo, min(hi, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_or(value, default, lo, hi):
+    try:
+        return max(lo, min(hi, float(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _flatten(text):
+    try:
+        return " ".join(
+            line.strip() for line in str(text or "").splitlines() if line.strip()
+        )
+    except Exception:
+        return ""
+
 
 def _get_windows():
     try:
@@ -40,33 +67,39 @@ def _get_windows():
     except Exception:
         return None
 
+
 _LINUX_TOOLS = [
     ("wl-paste", ["wl-paste", "--no-newline"]),
-    ("xclip",    ["xclip", "-selection", "clipboard", "-o"]),
-    ("xsel",     ["xsel", "--clipboard", "--output"]),
+    ("xclip", ["xclip", "-selection", "clipboard", "-o"]),
+    ("xsel", ["xsel", "--clipboard", "--output"]),
 ]
+
 
 def _get_linux():
     for name, cmd in _LINUX_TOOLS:
         if not shutil.which(name):
             continue
         try:
-            out = subprocess.check_output(
-                cmd, timeout=1, stderr=subprocess.DEVNULL)
+            out = subprocess.check_output(cmd, timeout=1, stderr=subprocess.DEVNULL)
             return out.decode("utf-8", "ignore")
-        except subprocess.CalledProcessError:
-            return ""
-        except Exception:
+        except subprocess.CalledProcessError as e:
+            log.debug("%s 读取剪贴板失败: %s", name, e)
+            continue
+        except Exception as e:
+            log.debug("%s 调用异常: %s", name, e)
             continue
     return None
 
+
 def _get_mac():
     try:
-        out = subprocess.check_output(["pbpaste"], timeout=1,
-                                      stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            ["pbpaste"], timeout=1, stderr=subprocess.DEVNULL
+        )
         return out.decode("utf-8", "ignore")
     except Exception:
         return None
+
 
 def _read_clipboard():
     try:
@@ -78,6 +111,7 @@ def _read_clipboard():
     except Exception:
         return None
 
+
 def _linux_hint():
     if not sys.platform.startswith("linux"):
         return None
@@ -86,6 +120,7 @@ def _linux_hint():
         return None
     return "apt install xclip  或  wl-clipboard"
 
+
 @register
 class ClipboardWidget(Widget):
     name = "clipboard"
@@ -93,68 +128,175 @@ class ClipboardWidget(Widget):
     orientations = BOTH
     priority = 60
 
+    actions = {
+        "next": "下一个",
+        "prev": "上一个",
+        "pin": "固定/取消固定",
+    }
+    touch_help = "单击=下一个，双击=上一个，长按=固定/取消固定"
+
     config_schema = [
         Field("max_chars", "int", "最大字符数", default=500, min=50, max=2000),
-        Field("poll_sec", "float", "轮询间隔(秒)", default=0.5,
-              min=0.2, max=5.0, step=0.1),
+        Field(
+            "poll_sec",
+            "float",
+            "轮询间隔(秒)",
+            default=0.5,
+            min=0.2,
+            max=5.0,
+            step=0.1,
+        ),
     ]
 
     def setup(self, ctx):
+        old = ctx.state.get("_cb")
+        if old:
+            ev = old.get("stop_ev")
+            if ev:
+                ev.set()
+            t = old.get("thread")
+            if t and t.is_alive():
+                t.join(timeout=1.0)
         st = {
             "text": "",
+            "history": [],
+            "index": 0,
             "available": True,
-            "t_last": 0.0,
             "scroll": 0.0,
             "pinned": False,
+            "pin_text": "",
+            "pin_index": 0,
             "lock": threading.Lock(),
-            "stop": False,
+            "stop_ev": threading.Event(),
+            "thread": None,
+            "_last_key": None,
         }
         ctx.state["_cb"] = st
         self._start_poller(ctx)
 
     def _start_poller(self, ctx):
         st = ctx.state["_cb"]
-        st["stop"] = False
+        stop_ev = st["stop_ev"]
 
         def loop():
-            while not st.get("stop"):
+            while not stop_ev.is_set():
                 cfg = self.get_config(ctx)
                 txt = _read_clipboard()
+                max_chars = _int_or(cfg.get("max_chars"), 500, 50, 2000)
                 with st["lock"]:
                     if txt is None:
                         st["available"] = False
                     else:
                         st["available"] = True
-                        txt = txt[:int(cfg["max_chars"])]
-                        if not st.get("pinned") and txt != st["text"]:
+                        txt = txt[:max_chars]
+                        if txt != st.get("text"):
                             st["text"] = txt
-                            st["scroll"] = 0.0
-                time.sleep(float(cfg["poll_sec"]))
+                            history = list(st.get("history") or [])
+                            history = [txt] + [old for old in history if old != txt]
+                            st["history"] = history[:12]
+                            if not st.get("pinned"):
+                                st["index"] = 0
+                                st["scroll"] = 0.0
+                poll = _float_or(cfg.get("poll_sec"), 0.5, 0.2, 5.0)
+                stop_ev.wait(poll)
 
-        threading.Thread(target=loop, daemon=True,
-                         name="ClipboardPoller").start()
+        t = threading.Thread(target=loop, daemon=True, name="ClipboardPoller")
+        st["thread"] = t
+        t.start()
 
     def teardown(self, ctx):
         st = ctx.state.get("_cb")
-        if st:
-            st["stop"] = True
+        if not st:
+            return
+        ev = st.get("stop_ev")
+        if ev:
+            ev.set()
+        t = st.get("thread")
+        if t and t.is_alive():
+            t.join(timeout=2.0)
 
     def on_enter(self, ctx):
         st = ctx.state.get("_cb")
         if st:
             st["scroll"] = 0.0
+            st["_last_key"] = None
+
+    def on_leave(self, ctx):
+        pass
 
     def on_action(self, action, payload, ctx):
-        st = ctx.state.get("_cb")
-        if st is None:
-            return {"ok": False, "err": "未初始化"}
-        if action in ("touch_long", "toggle_pin"):
-            with st["lock"]:
-                st["pinned"] = not st.get("pinned", False)
-            return {"ok": True}
-        return {"ok": False, "err": f"未知动作: {action}"}
+        try:
+            st = ctx.state.get("_cb")
+            if st is None:
+                return {"ok": False, "err": "未初始化"}
+            if action in ("pin", "toggle_pin", "touch_long"):
+                if not self._do_pin(st):
+                    return {"ok": False, "err": "没有可固定的内容"}
+                st["_last_key"] = None
+                return {"ok": True}
+            if action in ("next", "touch_single"):
+                if not self._do_step(st, 1):
+                    return {"ok": False, "err": "没有历史内容"}
+                st["_last_key"] = None
+                return {"ok": True}
+            if action in ("prev", "touch_double"):
+                if not self._do_step(st, -1):
+                    return {"ok": False, "err": "没有历史内容"}
+                st["_last_key"] = None
+                return {"ok": True}
+            return {"ok": False, "err": "未知动作: " + str(action)}
+        except Exception as exc:
+            log.warning("clipboard 动作 %s 失败: %s", action, exc)
+            return {"ok": False, "err": "动作失败"}
+
+    def _do_pin(self, st):
+        with st["lock"]:
+            if st.get("pinned"):
+                st["pinned"] = False
+                st["pin_text"] = ""
+                st["pin_index"] = 0
+                st["index"] = 0
+                return True
+            history = list(st.get("history") or [])
+            index = int(st.get("index", 0) or 0)
+            if history:
+                if index < 0 or index >= len(history):
+                    index = 0
+                display = history[index]
+            else:
+                display = st.get("text", "")
+            if not display:
+                return False
+            st["pinned"] = True
+            st["pin_text"] = display
+            st["pin_index"] = index
+            return True
+
+    def _do_step(self, st, delta):
+        with st["lock"]:
+            history = list(st.get("history") or [])
+            if not history:
+                return False
+            total = len(history)
+            if st.get("pinned"):
+                index = int(st.get("pin_index", 0) or 0)
+                index = (index + delta) % total
+                st["pin_index"] = index
+                st["pin_text"] = history[index]
+            else:
+                index = int(st.get("index", 0) or 0)
+                st["index"] = (index + delta) % total
+            st["scroll"] = 0.0
+            return True
 
     def render(self, ctx):
+        try:
+            return self._render(ctx)
+        except Exception as exc:
+            log.warning("clipboard 渲染失败: %s", exc)
+            return None
+
+    def _render(self, ctx):
         st = ctx.state.get("_cb") or {}
         lock = st.get("lock")
         if lock:
@@ -162,46 +304,77 @@ class ClipboardWidget(Widget):
                 text = st.get("text", "")
                 available = st.get("available", True)
                 pinned = st.get("pinned", False)
+                pin_text = st.get("pin_text", "")
+                history = list(st.get("history") or [])
+                index = int(st.get("index", 0) or 0)
         else:
             text, available, pinned = "", True, False
+            pin_text, history, index = "", [], 0
+
+        if pinned:
+            current = pin_text or text
+        elif history:
+            if index < 0 or index >= len(history):
+                index = 0
+            current = history[index]
+        else:
+            current = text
 
         W, H = ctx.size
-        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
 
         if not available:
-            d.text((W // 2, H // 2 - 10), "无法读取剪贴板",
-                   fill="#c05050", font=get_font(12, cjk=True), anchor="mm")
+            key = "na|%sx%s" % (W, H)
+            if st.get("_last_key") == key:
+                return None
+            img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.text(
+                (W // 2, H // 2 - 10),
+                "无法读取剪贴板",
+                fill="#c05050",
+                font=get_font(12, cjk=True),
+                anchor="mm",
+            )
             hint = _linux_hint()
             if hint:
-                d.text((W // 2, H // 2 + 8), hint,
-                       fill="#707070", font=get_font(9, cjk=False),
-                       anchor="mm")
+                d.text(
+                    (W // 2, H // 2 + 8),
+                    hint,
+                    fill="#707070",
+                    font=get_font(9, cjk=False),
+                    anchor="mm",
+                )
+            st["_last_key"] = key
             return img
 
-        if not text:
-            d.text((W // 2, H // 2), "(空)",
-                   fill="#505050", font=get_font(14, cjk=False), anchor="mm")
+        flat = _flatten(current)
+
+        if not flat:
+            key = "empty|%sx%s|%s" % (W, H, pinned)
+            if st.get("_last_key") == key:
+                return None
+            img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            d.text(
+                (W // 2, H // 2),
+                "(空)",
+                fill="#505050",
+                font=get_font(14, cjk=False),
+                anchor="mm",
+            )
             if pinned:
                 d.ellipse([W - 8, 3, W - 4, 7], fill="#ff5555")
+            st["_last_key"] = key
             return img
 
-        flat = " ".join(line.strip() for line in text.splitlines()
-                        if line.strip())
-
-        f = get_font(11, cjk=True) if ctx.orientation == LANDSCAPE \
-            else get_font(12, cjk=True)
+        f = get_font(11, cjk=True) if ctx.orientation == LANDSCAPE else get_font(12, cjk=True)
         line_h = 14
         max_w = W - 8
         lines = self._wrap(flat, f, max_w)
         total_h = len(lines) * line_h
 
         if total_h <= H - 4:
-            y = (H - total_h) // 2
-            for line in lines:
-                d.text((W // 2, y + line_h // 2), line,
-                       fill="#e0e0e0", font=f, anchor="mm")
-                y += line_h
+            off = 0
         else:
             max_scroll = total_h - (H - 4)
             if lock:
@@ -210,32 +383,67 @@ class ClipboardWidget(Widget):
                     off = int(st["scroll"])
             else:
                 off = 0
+
+        key = "%sx%s|%s|%s|%s" % (W, H, pinned, off, flat)
+        if st.get("_last_key") == key:
+            return None
+
+        img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+
+        if off == 0 and total_h <= H - 4:
+            y = (H - total_h) // 2
+            for line in lines:
+                x = max(2, (W - text_w(f, line)) // 2)
+                row_text(
+                    img,
+                    (x, y + line_h // 2),
+                    line,
+                    f,
+                    "#e0e0e0",
+                    max(1, W - x - 2),
+                    ctx.now,
+                    scroll=True,
+                )
+                y += line_h
+        else:
             y = 2 - off
             for line in lines:
                 if -line_h < y < H:
-                    d.text((W // 2, y + line_h // 2), line,
-                           fill="#e0e0e0", font=f, anchor="mm")
+                    row_text(
+                        img,
+                        (2, y + line_h // 2),
+                        line,
+                        f,
+                        "#e0e0e0",
+                        max(1, W - 4),
+                        ctx.now,
+                        scroll=True,
+                    )
                 y += line_h
 
         if pinned:
-            d.ellipse([W - 8, 3, W - 4, 7], fill="#ff5555")
+            ImageDraw.Draw(img).ellipse([W - 8, 3, W - 4, 7], fill="#ff5555")
 
+        st["_last_key"] = key
         return img
 
     def _wrap(self, text, font, max_w):
         out = []
-        cur = ""
+        cur = []
+        width = 0.0
         for ch in text:
             try:
-                w = font.getlength(cur + ch)
+                w = font.getlength(ch)
             except Exception:
-                w = len(cur + ch) * 7
-            if w <= max_w:
-                cur += ch
+                w = 7.0
+            if width + w <= max_w:
+                cur.append(ch)
+                width += w
             else:
                 if cur:
-                    out.append(cur)
-                cur = ch
+                    out.append("".join(cur))
+                cur = [ch]
+                width = w
         if cur:
-            out.append(cur)
+            out.append("".join(cur))
         return out or [""]
