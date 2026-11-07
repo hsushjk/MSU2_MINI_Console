@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import datetime
 import json
 import logging
@@ -14,25 +15,40 @@ import time
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    _APP_DIR = Path(os.path.dirname(os.path.abspath(sys.executable)))
+else:
+    _APP_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+_HERE = str(_APP_DIR)
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
+
+def _console(text):
+    try:
+        print(text, file=sys.stderr)
+    except Exception:
+        pass
 
 try:
     import serial
     import serial.tools.list_ports
 except ImportError:
-    print("缺少 pyserial: pip install pyserial", file=sys.stderr); sys.exit(1)
+    _console("缺少 pyserial: pip install pyserial"); sys.exit(1)
 
 try:
     from PIL import Image
 except ImportError:
-    print("缺少 Pillow: pip install pillow", file=sys.stderr); sys.exit(1)
+    _console("缺少 Pillow: pip install pillow"); sys.exit(1)
 
 try:
     import psutil
 except ImportError:
-    print("缺少 psutil: pip install psutil", file=sys.stderr); sys.exit(1)
+    _console("缺少 psutil: pip install psutil"); sys.exit(1)
+
+try:
+    import numpy as _np
+except Exception:
+    _np = None
 
 try:
     from msu2_core import (
@@ -43,7 +59,7 @@ try:
     )
     import widgets as _widgets_pkg
 except ImportError as e:
-    print(f"无法导入 msu2_core/widgets: {e}", file=sys.stderr); sys.exit(1)
+    _console(f"无法导入 msu2_core/widgets: {e}"); sys.exit(1)
 
 SCREEN_W, SCREEN_H = LANDSCAPE_SIZE
 SCREEN_BAUD = 19200
@@ -55,6 +71,15 @@ TOUCH_SAMPLE_INTERVAL = 0.06
 TOUCH_LONG_PRESS = 0.8
 TOUCH_DOUBLE_WINDOW = 0.35
 TOUCH_DEFAULT_THRESHOLD = 60
+
+SCREENSHOT_DIR = _APP_DIR / "screenshots"
+DEFAULT_GIF_DIR = _APP_DIR / "assets" / "gif"
+MAX_REQUEST_BYTES = 32 * 1024
+MAX_CONFIG_BYTES = 4 * 1024 * 1024
+MAX_RESOURCE_BYTES = 8 * 1024 * 1024
+MAX_TEXT_BYTES = 1024 * 1024
+IMAGE_EXTS = (".gif", ".png", ".jpg", ".jpeg", ".webp", ".bmp")
+TEXT_EXTS = (".md", ".txt")
 
 log = logging.getLogger("msu2")
 
@@ -186,6 +211,29 @@ class SerialTransport:
                 self._connected = False; self._handshaked = False
                 return b""
 
+    def read_adc(self, ch, timeout=0.05):
+        with self._lock:
+            if not self._connected or not self._ser:
+                return None
+            t0 = time.monotonic()
+            buf = bytearray()
+            while time.monotonic() - t0 < timeout:
+                try:
+                    n = self._ser.in_waiting
+                    if n:
+                        buf.extend(self._ser.read(n))
+                except Exception:
+                    self._connected = False; self._handshaked = False
+                    return None
+                while len(buf) >= 6:
+                    if buf[0] == Cmd.ADC and buf[1] == ch:
+                        val = (buf[4] << 8) | buf[5]
+                        del buf[:6]
+                        return val
+                    del buf[0]
+                time.sleep(0.002)
+            return None
+
     def handshake(self, timeout=2.0):
         if self._handshaked:
             return True
@@ -207,17 +255,40 @@ class SerialTransport:
 class FrameEncoder:
     SEG = 256
 
+    def __init__(self):
+        self._last_raw = None
+
+    def reset(self):
+        self._last_raw = None
+
+    @staticmethod
+    def _to_rgb565(img):
+        data = img.tobytes()
+        if _np is not None:
+            a = _np.frombuffer(data, dtype=_np.uint8).reshape(-1, 3)
+            a = a.astype(_np.uint16)
+            v = ((a[:, 0] >> 3) << 11) | ((a[:, 1] >> 2) << 5) | (a[:, 2] >> 3)
+            return v.astype(">u2").tobytes()
+        r = data[0::3]
+        g = data[1::3]
+        b = data[2::3]
+        n = len(r)
+        raw = bytearray(n * 2)
+        for k in range(n):
+            v = ((r[k] >> 3) << 11) | ((g[k] >> 2) << 5) | (b[k] >> 3)
+            raw[2 * k] = v >> 8
+            raw[2 * k + 1] = v & 0xFF
+        return bytes(raw)
+
     def encode(self, img):
         if img.size != (SCREEN_W, SCREEN_H):
             img = img.resize((SCREEN_W, SCREEN_H))
-        img = img.convert("RGB")
-        raw = bytearray(SCREEN_W * SCREEN_H * 2)
-        px = img.load(); i = 0
-        for yy in range(SCREEN_H):
-            for xx in range(SCREEN_W):
-                r, g, b = px[xx, yy]
-                v = ((r >> 3) << 11) | ((g >> 2) << 5) | (b >> 3)
-                raw[i] = v >> 8; raw[i+1] = v & 0xFF; i += 2
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        raw = self._to_rgb565(img)
+        if raw == self._last_raw:
+            return b""
+        self._last_raw = raw
 
         out = bytearray()
         out += MiniProtocol.lcd_set_xy(0, 0)
@@ -226,29 +297,24 @@ class FrameEncoder:
 
         total = len(raw)
         n_segs = (total + 255) // 256
-        tail = total % 256
         for si in range(n_segs):
-            seg = bytes(raw[si*256:(si+1)*256])
+            seg = bytearray(raw[si * 256:(si + 1) * 256])
             if len(seg) < 256:
                 seg += b"\xff" * (256 - len(seg))
-            units = [seg[k:k+4] for k in range(0, 256, 4)]
+            units = [bytes(seg[k:k + 4]) for k in range(0, 256, 4)]
             counts = {}
             for u in units:
                 counts[u] = counts.get(u, 0) + 1
-            fill, _ = max(counts.items(), key=lambda kv: kv[1])
+            fill = max(counts, key=counts.get)
             out += MiniProtocol.lcd_set_fill(*fill)
-            diff = sum(1 for u in units if u != fill)
-            if diff / 64 > 0.7:
-                for i, u in enumerate(units):
-                    out += MiniProtocol.lcd_data_block(i, *u)
+            if sum(1 for u in units if u != fill) > 44:
+                for idx, u in enumerate(units):
+                    out += MiniProtocol.lcd_data_block(idx, *u)
             else:
-                for i, u in enumerate(units):
+                for idx, u in enumerate(units):
                     if u != fill:
-                        out += MiniProtocol.lcd_data_block(i, *u)
-            if si == n_segs - 1 and tail != 0:
-                out += MiniProtocol.lcd_segment_end_tail(tail)
-            else:
-                out += MiniProtocol.lcd_segment_end_full()
+                        out += MiniProtocol.lcd_data_block(idx, *u)
+            out += MiniProtocol.lcd_segment_end_full()
         return bytes(out)
 
 def _normalize_port(port):
@@ -269,7 +335,12 @@ class MiniDevice:
         self.encoder = FrameEncoder()
         self.screen_reversed = False
 
-    def open(self):   return self.transport.open()
+    def open(self):
+        ok = self.transport.open()
+        if ok:
+            self.encoder.reset()
+        return ok
+
     def close(self):  self.transport.close()
 
     @property
@@ -277,6 +348,8 @@ class MiniDevice:
 
     def show_image(self, img):
         frame = self.encoder.encode(img)
+        if not frame:
+            return True
         SEG = 2048
         for i in range(0, len(frame), SEG):
             if not self.transport.write(frame[i:i+SEG]):
@@ -287,8 +360,7 @@ class MiniDevice:
         return True
 
     def set_reverse(self, reverse):
-        self.screen_reversed = reverse
-        self.transport.write(MiniProtocol.lcd_direction(1 if reverse else 0))
+        self.screen_reversed = bool(reverse)
 
     def heartbeat(self):
         ok = self.transport.write(MiniProtocol.read_adc(15))
@@ -299,67 +371,97 @@ class MiniDevice:
     def read_touch(self):
         if not self.transport.write(MiniProtocol.read_adc(TOUCH_CH)):
             return None
-        time.sleep(0.015)
-        rsp = self.transport.read_all()
-        if len(rsp) >= 6:
-            return (rsp[4] << 8) | rsp[5]
-        return None
+        return self.transport.read_adc(TOUCH_CH, timeout=0.03)
 
 class Background:
+    MAX_FRAMES = 300
+    MODES = ("fit", "fill", "stretch")
+
     def __init__(self):
         self.path = ""
+        self.mode = "fit"
         self.frames = []
         self.durations = []
         self.idx = 0
-        self.t_last = 0.0
+        self.t_last = None
 
-    def load(self, path):
+    def load(self, path, mode=None):
         self.path = path
+        if mode is not None:
+            self.mode = mode if mode in self.MODES else "fit"
         self.frames = []; self.durations = []
-        self.idx = 0; self.t_last = 0.0
+        self.idx = 0; self.t_last = None
         if not path:
             return
         p = Path(path)
         if not p.exists():
             log.warning("背景图不存在: %s", p); return
+        if p.is_dir():
+            self._load_dir(p)
+            return
         try:
-            src = Image.open(p)
-        except Exception as e:
-            log.warning("背景图加载失败: %s", e); return
-
-        try:
-            if getattr(src, "is_animated", False):
-                for i in range(src.n_frames):
-                    src.seek(i)
-                    self.frames.append(self._letterbox(src.convert("RGB")))
-                    self.durations.append(
-                        max(0.05, src.info.get("duration", 100) / 1000.0))
-            else:
-                self.frames = [self._letterbox(src.convert("RGB"))]
-                self.durations = [0.0]
+            with Image.open(p) as src:
+                if getattr(src, "is_animated", False):
+                    for i in range(min(src.n_frames, self.MAX_FRAMES)):
+                        src.seek(i)
+                        self.frames.append(self._frame(src.convert("RGB")))
+                        self.durations.append(
+                            max(0.05, src.info.get("duration", 100) / 1000.0))
+                else:
+                    self.frames = [self._frame(src.convert("RGB"))]
+                    self.durations = [0.0]
         except Exception as e:
             log.warning("背景图处理失败: %s", e)
-            self.frames = []
-        log.info("背景图已加载: %s (%d 帧)", path, len(self.frames))
+            self.frames = []; self.durations = []
+        log.info("背景图已加载: %s (%d 帧, 模式 %s)", path, len(self.frames), self.mode)
 
-    @staticmethod
-    def _letterbox(img):
+    def _load_dir(self, p):
+        try:
+            files = sorted(x for x in p.iterdir()
+                           if x.is_file() and x.suffix.lower() in IMAGE_EXTS)
+        except Exception as e:
+            log.warning("扫描图片目录失败: %s", e); return
+        for f in files[:self.MAX_FRAMES]:
+            try:
+                with Image.open(f) as src:
+                    self.frames.append(self._frame(src.convert("RGB")))
+                self.durations.append(0.2)
+            except Exception as e:
+                log.warning("跳过图片 %s: %s", f.name, e)
+        log.info("背景图序列已加载: %s (%d 张, 模式 %s)", p, len(self.frames),
+                 self.mode)
+
+    def _frame(self, img):
         tw, th = SCREEN_W, SCREEN_H
-        scale = min(tw / img.width, th / img.height)
-        nw = max(1, int(img.width * scale))
-        nh = max(1, int(img.height * scale))
-        img = img.resize((nw, nh), Image.LANCZOS)
-        canvas = Image.new("RGB", (tw, th), "black")
-        canvas.paste(img, ((tw - nw) // 2, (th - nh) // 2))
-        return canvas
+        mode = self.mode if self.mode in self.MODES else "fit"
+        try:
+            if mode == "stretch":
+                return img.resize((tw, th), Image.LANCZOS)
+            scale = (max(tw / img.width, th / img.height) if mode == "fill"
+                     else min(tw / img.width, th / img.height))
+            nw = max(1, int(img.width * scale))
+            nh = max(1, int(img.height * scale))
+            img = img.resize((nw, nh), Image.LANCZOS)
+            if mode == "fill":
+                x = max(0, (nw - tw) // 2)
+                y = max(0, (nh - th) // 2)
+                return img.crop((x, y, x + tw, y + th))
+            canvas = Image.new("RGB", (tw, th), "black")
+            canvas.paste(img, ((tw - nw) // 2, (th - nh) // 2))
+            return canvas
+        except Exception as e:
+            log.warning("背景变换失败: %s", e)
+            return Image.new("RGB", (tw, th), "black")
 
     def tick(self, now):
         if not self.frames:
             return None
         if len(self.frames) == 1:
             return self.frames[0]
-        dur = self.durations[self.idx]
-        if now - self.t_last >= dur:
+        if self.t_last is None:
+            self.t_last = now
+            return self.frames[0]
+        if now - self.t_last >= self.durations[self.idx]:
             self.idx = (self.idx + 1) % len(self.frames)
             self.t_last = now
         return self.frames[self.idx]
@@ -367,8 +469,8 @@ class Background:
 def _act_screenshot():
     try:
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        out_dir = Path("./screenshots")
-        out_dir.mkdir(exist_ok=True)
+        out_dir = Path(SCREENSHOT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
         p = out_dir / f"shot_{ts}.png"
         try:
             from PIL import ImageGrab
@@ -460,9 +562,11 @@ def _act_send_macro(combo):
             main_key = p
 
     ctrl = Controller()
+    pressed = []
     try:
         for m in mods:
             ctrl.press(m)
+            pressed.append(m)
         if main_key:
             k = None
             if len(main_key) == 1:
@@ -473,13 +577,15 @@ def _act_send_macro(combo):
                 k = getattr(Key, main_key, None)
             if k is not None:
                 ctrl.press(k); ctrl.release(k)
-        for m in reversed(mods):
-            ctrl.release(m)
         log.info("宏已发送: %s", combo)
         return True
     except Exception as e:
         log.warning("宏发送失败: %s", e)
         return False
+    finally:
+        for m in reversed(pressed):
+            try: ctrl.release(m)
+            except Exception: pass
 
 def _act_launch_program(cmd):
     cmd = (cmd or "").strip()
@@ -505,6 +611,17 @@ def _act_launch_program(cmd):
         log.warning("启动程序失败: %s", e)
         return False
 
+def _coerce_int(value, default, lo=None, hi=None):
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        v = default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
 class Scheduler(threading.Thread):
     def __init__(self, device, config, on_config_changed=None, on_shutdown=None):
         super().__init__(daemon=True, name="Scheduler")
@@ -515,32 +632,54 @@ class Scheduler(threading.Thread):
 
         self.orientation = config.get("orientation", LANDSCAPE)
         self.reverse = bool(config.get("reverse", False))
-        self.portrait_rotate = int(config.get("portrait_rotate", -90))
+        self.portrait_rotate = _coerce_int(config.get("portrait_rotate", -90), -90)
 
-        bg = config.get("background", {})
+        bg = config.get("background")
+        if not isinstance(bg, dict):
+            bg = {}
         self._bg_enabled = bool(bg.get("enabled", False))
         self._bg_path = str(bg.get("path", "") or "")
+        self._bg_mode = bg.get("mode")
+        if self._bg_mode not in Background.MODES:
+            self._bg_mode = "fit"
         self.background = Background()
         if self._bg_enabled and self._bg_path:
-            self.background.load(self._bg_path)
+            self.background.load(self._bg_path, self._bg_mode)
 
+        self._touch_baseline = None
+        self._touch_cal = []
+        self._touch_pressed = False
+        self._touch_press_ts = 0.0
+        self._touch_last_sample_ts = 0.0
+        self._touch_waiting_double = False
+        self._touch_double_ts = 0.0
+        self._touch_long_fired = False
+        self._locked = False
         self._load_touch_cfg(config)
 
         self.ctx = RenderContext(
             device=device, now=time.time(),
             orientation=self.orientation, config=config,
         )
+        self._ctxs = {}
+        self._last_entered = None
+        self._last_imgs = {}
+        self._force_send = False
         self._stop = threading.Event()
         self._switch = threading.Event()
+        self._ops = collections.deque()
+        self._ops_lock = threading.Lock()
         self._widgets = []
         self._current = 0
         self._cooldown_until = 0.0
-        self._last_send_ts = 0.0
+        self._last_send_mono = 0.0
 
         self._reload_widgets()
 
     def _load_touch_cfg(self, config):
-        tk = config.get("touch", {}) or {}
+        tk = config.get("touch")
+        if not isinstance(tk, dict):
+            tk = {}
         self._touch_cfg = {
             "single": tk.get("single", "next_page"),
             "double": tk.get("double", "toggle_orientation"),
@@ -551,7 +690,8 @@ class Scheduler(threading.Thread):
             "program_single": str(tk.get("program_single", "") or ""),
             "program_double": str(tk.get("program_double", "") or ""),
             "program_long":   str(tk.get("program_long", "") or ""),
-            "threshold": int(tk.get("threshold", TOUCH_DEFAULT_THRESHOLD)),
+            "threshold": _coerce_int(tk.get("threshold", TOUCH_DEFAULT_THRESHOLD),
+                                     TOUCH_DEFAULT_THRESHOLD, 5, 2000),
         }
         self._touch_baseline = None
         self._touch_cal = []
@@ -560,20 +700,38 @@ class Scheduler(threading.Thread):
         self._touch_last_sample_ts = 0.0
         self._touch_waiting_double = False
         self._touch_double_ts = 0.0
-        self._locked = False
+        self._touch_long_fired = False
 
     def set_touch_config(self, new_cfg):
-        tk = self.config.setdefault("touch", {})
+        if not isinstance(new_cfg, dict):
+            new_cfg = {}
+        tk = self.config.get("touch")
+        if not isinstance(tk, dict):
+            tk = {}
+            self.config["touch"] = tk
         for k in ("single", "double", "long",
                   "macro_single", "macro_double", "macro_long",
-                  "program_single", "program_double", "program_long",
-                  "threshold"):
-            if k in new_cfg:
-                tk[k] = new_cfg[k]
+                  "program_single", "program_double", "program_long"):
+            if k not in new_cfg:
+                continue
+            v = new_cfg[k]
+            if v is None:
+                v = ""
+            elif not isinstance(v, str):
+                v = str(v)
+            tk[k] = v[:512].strip()
+            if k in ("single", "double", "long") and tk[k] not in _TOUCH_ACTIONS:
+                tk[k] = "passthrough"
+        if "threshold" in new_cfg:
+            tk["threshold"] = _coerce_int(new_cfg["threshold"],
+                                          TOUCH_DEFAULT_THRESHOLD, 5, 2000)
         self._load_touch_cfg(self.config)
         log.info("触摸配置已更新: %s", self._touch_cfg)
 
-    def _allow(self, name="操作"):
+    def _allow(self, name="操作", from_touch=False):
+        if not from_touch:
+            self._cooldown_until = time.monotonic() + MANUAL_COOLDOWN
+            return True
         now = time.monotonic()
         if now < self._cooldown_until:
             log.info("%s 被冷却拒绝 (还剩 %.2fs)",
@@ -582,18 +740,61 @@ class Scheduler(threading.Thread):
         self._cooldown_until = now + MANUAL_COOLDOWN
         return True
 
+    def _ctx_for(self, w):
+        ctx = self._ctxs.get(w.name)
+        if ctx is None:
+            ctx = RenderContext(device=self.device, now=time.time(),
+                                orientation=self.orientation,
+                                state={}, config=self.config)
+            self._ctxs[w.name] = ctx
+        return ctx
+
+    def post_op(self, op, *args):
+        with self._ops_lock:
+            self._ops.append((op, args))
+
+    def _drain_ops(self):
+        while True:
+            with self._ops_lock:
+                if not self._ops:
+                    return
+                op, args = self._ops.popleft()
+            try:
+                if op == "reload":
+                    self._reload_widgets()
+                elif op == "restart":
+                    self._restart_widget(*args)
+                elif op == "background":
+                    self._apply_background()
+            except Exception as e:
+                log.warning("后台任务 %s 失败: %s", op, e)
+
+    def _teardown_all(self):
+        for w in list(self._widgets):
+            try: w.teardown(self._ctx_for(w))
+            except Exception as e:
+                log.warning("插件 %s teardown 失败: %s", w.name, e)
+        self._ctxs.clear()
+        self._last_imgs.clear()
+        self._last_entered = None
+
     def _reload_widgets(self):
-        for w in self._widgets:
-            try: w.teardown(self.ctx)
-            except Exception: pass
+        self._teardown_all()
+
+        names = []
+        for name in self.config.get("pages") or []:
+            if name in names:
+                log.warning("重复的页面已忽略: %s", name)
+                continue
+            names.append(name)
 
         new_widgets = []
-        for name in self.config.get("pages", []):
+        for name in names:
             cls = WIDGET_REGISTRY.get(name)
             if not cls:
                 log.warning("未知插件: %s", name); continue
             w = cls()
-            try: w.setup(self.ctx)
+            try: w.setup(self._ctx_for(w))
             except Exception as e:
                 log.warning("插件 %s setup 失败: %s", name, e)
             new_widgets.append(w)
@@ -609,6 +810,7 @@ class Scheduler(threading.Thread):
 
         self._widgets = new_widgets
         self._current = new_current
+        self._switch.set()
 
         log.info("已加载 %d 个插件: %s (当前: %s)",
                  len(self._widgets),
@@ -616,16 +818,19 @@ class Scheduler(threading.Thread):
                  self._widgets[self._current].name if self._widgets else "-")
         self._ensure_supported()
 
+    def _save_config(self):
+        if self._on_config_changed:
+            try: self._on_config_changed()
+            except Exception as e:
+                log.warning("保存配置失败: %s", e)
+
     def _persist_current(self):
         if not self._widgets:
             return
         name = self._widgets[self._current].name
         if self.config.get("current_page") != name:
             self.config["current_page"] = name
-            if self._on_config_changed:
-                try: self._on_config_changed()
-                except Exception as e:
-                    log.warning("保存 current_page 失败: %s", e)
+            self._save_config()
 
     def find_widget(self, name):
         for w in self._widgets:
@@ -634,31 +839,36 @@ class Scheduler(threading.Thread):
         return None
 
     def _ensure_supported(self):
-        if not self._widgets: return
+        if not self._widgets:
+            return False
         if self.orientation in self._widgets[self._current].orientations:
-            return
-        self._find_supported(self._current, +1)
+            return True
+        if not self._find_supported(self._current, +1):
+            log.warning("没有插件支持 %s 朝向", self.orientation)
+            return False
+        return True
 
     def _find_supported(self, start, direction):
         n = len(self._widgets)
-        if n == 0: return False
+        if n == 0:
+            return False
         for i in range(n):
             idx = (start + i * direction) % n
             if self.orientation in self._widgets[idx].orientations:
-                self._current = idx
-                self._persist_current()
+                if idx != self._current:
+                    self._current = idx
+                    self._persist_current()
                 return True
         return False
 
     def reload(self):
-        self._reload_widgets()
-        self._switch.set()
+        self.post_op("reload")
 
     def next_page(self, from_touch=False):
         if from_touch and self._locked:
             log.info("已锁定，忽略触摸翻页")
             return False
-        if not self._allow("next_page"): return False
+        if not self._allow("next_page", from_touch): return False
         if not self._widgets: return False
         self._find_supported(self._current + 1, +1)
         self._switch.set()
@@ -669,7 +879,7 @@ class Scheduler(threading.Thread):
         if from_touch and self._locked:
             log.info("已锁定，忽略触摸翻页")
             return False
-        if not self._allow("prev_page"): return False
+        if not self._allow("prev_page", from_touch): return False
         if not self._widgets: return False
         self._find_supported(self._current - 1, -1)
         self._switch.set()
@@ -677,18 +887,22 @@ class Scheduler(threading.Thread):
         return True
 
     def toggle_reverse(self, from_touch=False):
-        if not self._allow("toggle_reverse"): return False
+        if not self._allow("toggle_reverse", from_touch): return False
         self.reverse = not self.reverse
         self.device.set_reverse(self.reverse)
+        self.config["reverse"] = self.reverse
+        self._save_config()
         self._switch.set()
         log.info("翻转 -> %s", self.reverse)
         return True
 
     def toggle_orientation(self, from_touch=False):
-        if not self._allow("toggle_orientation"): return False
+        if not self._allow("toggle_orientation", from_touch): return False
         self.orientation = (PORTRAIT if self.orientation == LANDSCAPE
                             else LANDSCAPE)
         self.ctx.orientation = self.orientation
+        self.config["orientation"] = self.orientation
+        self._save_config()
         self._ensure_supported()
         self._switch.set()
         log.info("朝向 -> %s", self.orientation)
@@ -700,31 +914,63 @@ class Scheduler(threading.Thread):
         return True
 
     def set_pages(self, page_names):
-        self.config["pages"] = list(page_names)
-        self._reload_widgets()
-        self._switch.set()
-        log.info("页面已更新: %s", page_names)
-        return True
+        seen = set()
+        pages = []
+        for name in page_names:
+            if not isinstance(name, str) or name in seen:
+                continue
+            if name not in WIDGET_REGISTRY:
+                continue
+            seen.add(name)
+            pages.append(name)
+        self.config["pages"] = pages
+        self.post_op("reload")
+        log.info("页面已更新: %s", pages)
+        return pages
 
-    def set_background(self, enabled, path=""):
+    def set_background(self, enabled, path="", mode=None):
         self._bg_enabled = bool(enabled)
         self._bg_path = str(path or "")
-        if self._bg_enabled and self._bg_path:
-            self.background.load(self._bg_path)
-        else:
-            self.background.load("")
-        self._switch.set()
-        log.info("背景 -> enabled=%s path=%s", self._bg_enabled, self._bg_path)
+        if mode is not None:
+            self._bg_mode = mode if mode in Background.MODES else "fit"
+        self.post_op("background")
         return True
 
+    def _apply_background(self):
+        if self._bg_enabled and self._bg_path:
+            self.background.load(self._bg_path, self._bg_mode)
+        else:
+            self.background.load("", self._bg_mode)
+        self._switch.set()
+        log.info("背景 -> enabled=%s mode=%s path=%s",
+                 self._bg_enabled, self._bg_mode, self._bg_path)
+
+    def switch_to(self, name):
+        for i, w in enumerate(self._widgets):
+            if w.name == name:
+                if i != self._current:
+                    self._current = i
+                    self._persist_current()
+                    self._switch.set()
+                    log.info("切页 -> %s", name)
+                return True
+        return False
+
     def restart_widget(self, name):
+        self.post_op("restart", name)
+        return True
+
+    def _restart_widget(self, name):
         w = self.find_widget(name)
         if not w:
+            log.warning("重启失败，未找到插件: %s", name)
             return False
-        try: w.teardown(self.ctx)
+        try: w.teardown(self._ctx_for(w))
         except Exception: pass
+        self._ctxs.pop(name, None)
+        self._last_imgs.pop(name, None)
         try:
-            w.setup(self.ctx)
+            w.setup(self._ctx_for(w))
             self._switch.set()
             return True
         except Exception as e:
@@ -748,29 +994,32 @@ class Scheduler(threading.Thread):
 
         thr = self._touch_cfg["threshold"]
         pressed = v < (self._touch_baseline - thr)
+        log.debug("touch adc=%d base=%d thr=%d pressed=%s",
+                  v, self._touch_baseline, thr, pressed)
 
         if pressed and not self._touch_pressed:
             self._touch_press_ts = now
             self._touch_pressed = True
-            if self._touch_waiting_double:
-                pass
+            self._touch_long_fired = False
+        elif pressed and self._touch_pressed:
+            if (not self._touch_long_fired and
+                    now - self._touch_press_ts >= TOUCH_LONG_PRESS):
+                self._touch_long_fired = True
+                self._touch_waiting_double = False
+                log.info("触摸: 长按")
+                self._dispatch_touch("long")
         elif not pressed and self._touch_pressed:
             self._touch_pressed = False
-            hold = now - self._touch_press_ts
-
-            if hold >= TOUCH_LONG_PRESS:
+            if self._touch_long_fired:
+                pass
+            elif (self._touch_waiting_double and
+                    now - self._touch_double_ts <= TOUCH_DOUBLE_WINDOW):
                 self._touch_waiting_double = False
-                log.info("触摸: 长按 (%.2fs)", hold)
-                self._dispatch_touch("long")
+                log.info("触摸: 双击")
+                self._dispatch_touch("double")
             else:
-                if self._touch_waiting_double and \
-                        now - self._touch_double_ts <= TOUCH_DOUBLE_WINDOW:
-                    self._touch_waiting_double = False
-                    log.info("触摸: 双击")
-                    self._dispatch_touch("double")
-                else:
-                    self._touch_waiting_double = True
-                    self._touch_double_ts = now
+                self._touch_waiting_double = True
+                self._touch_double_ts = now
 
         if self._touch_waiting_double and \
                 now - self._touch_double_ts > TOUCH_DOUBLE_WINDOW:
@@ -778,27 +1027,23 @@ class Scheduler(threading.Thread):
             log.info("触摸: 单击")
             self._dispatch_touch("single")
 
-    def _all_passthrough(self):
-        return (self._touch_cfg.get("single") == "passthrough" and
-                self._touch_cfg.get("double") == "passthrough" and
-                self._touch_cfg.get("long") == "passthrough")
-
     def _dispatch_touch(self, gesture):
-        if self._all_passthrough():
-            w = self._widgets[self._current] if self._widgets else None
-            if w:
-                try:
-                    r = w.on_action(f"touch_{gesture}", {}, self.ctx)
-                    if isinstance(r, dict) and r.get("ok"):
-                        self._switch.set()
-                except Exception as e:
-                    log.warning("插件 %s touch_%s 失败: %s",
-                                w.name, gesture, e)
-            return
-
-        action = self._touch_cfg.get(gesture, "next_page")
+        action = self._touch_cfg.get(gesture, "passthrough")
+        if action not in _TOUCH_ACTIONS:
+            action = "passthrough"
         macro = self._touch_cfg.get(f"macro_{gesture}", "")
         program = self._touch_cfg.get(f"program_{gesture}", "")
+        if action == "passthrough":
+            w = self._widgets[self._current] if self._widgets else None
+            if w is None:
+                return
+            try:
+                r = w.on_action(f"touch_{gesture}", {}, self._ctx_for(w))
+                if isinstance(r, dict) and r.get("ok"):
+                    self._switch.set()
+            except Exception as e:
+                log.warning("插件 %s touch_%s 失败: %s", w.name, gesture, e)
+            return
         try:
             self._exec_action(action, macro, program, from_touch=True)
         except Exception as e:
@@ -832,83 +1077,151 @@ class Scheduler(threading.Thread):
         else:
             log.warning("未知触摸动作: %s", action)
 
-    def _composite(self, widget_img):
-        if self.orientation == PORTRAIT:
-            widget_img = widget_img.rotate(self.portrait_rotate, expand=True)
-        if widget_img.size != (SCREEN_W, SCREEN_H):
-            widget_img = widget_img.resize((SCREEN_W, SCREEN_H))
-        if widget_img.mode != "RGBA":
-            widget_img = widget_img.convert("RGBA")
-        bg = self.background.tick(time.time())
+    def _composite(self, widget_img, mono):
+        bg = self.background.tick(mono)
         if bg is None:
-            bg = Image.new("RGB", (SCREEN_W, SCREEN_H), "black")
-        return Image.alpha_composite(bg.convert("RGBA"), widget_img).convert("RGB")
+            canvas = Image.new("RGBA", (SCREEN_W, SCREEN_H), "black")
+        else:
+            canvas = bg.convert("RGBA")
+        if widget_img is None:
+            out = canvas.convert("RGB")
+        else:
+            if self.orientation == PORTRAIT:
+                widget_img = widget_img.rotate(self.portrait_rotate, expand=True)
+            if widget_img.size != (SCREEN_W, SCREEN_H):
+                widget_img = widget_img.resize((SCREEN_W, SCREEN_H))
+            if widget_img.mode != "RGBA":
+                widget_img = widget_img.convert("RGBA")
+            out = Image.alpha_composite(canvas, widget_img).convert("RGB")
+        if self.reverse:
+            out = out.rotate(180)
+        return out
+
+    def _handle_switch(self):
+        widgets = self._widgets
+        current = self._current
+        cur = widgets[current] if 0 <= current < len(widgets) else None
+        prev = self._last_entered
+        if prev is not None and prev is not cur:
+            try: prev.on_leave(self._ctx_for(prev))
+            except Exception as e:
+                log.warning("on_leave %s 失败: %s", prev.name, e)
+            if all(x is not prev for x in widgets):
+                self._ctxs.pop(prev.name, None)
+        if cur is not None:
+            self._last_entered = cur
+            try: cur.on_enter(self._ctx_for(cur))
+            except Exception as e:
+                log.warning("on_enter %s 失败: %s", cur.name, e)
+        self._force_send = True
 
     def run(self):
         log.info("Scheduler 启动, %d 页, 朝向 %s, 翻转 %s",
                  len(self._widgets), self.orientation, self.reverse)
-        last_ts = 0.0
-        while not self._stop.is_set():
-            if not self.device.connected:
-                if not self.device.open():
-                    time.sleep(1.0); continue
-                self.device.set_reverse(self.reverse)
-                last_ts = 0.0
+        last_mono = 0.0
+        last_bg_ts = 0.0
+        try:
+            while not self._stop.is_set():
+                if not self.device.connected:
+                    if not self.device.open():
+                        time.sleep(1.0); continue
+                    self.device.set_reverse(self.reverse)
+                    last_mono = 0.0
+                    last_bg_ts = 0.0
 
-            widgets = self._widgets
-            current = self._current
-            if not widgets or current >= len(widgets):
-                time.sleep(0.5); continue
+                self._drain_ops()
 
-            if self._switch.is_set():
-                self._switch.clear()
-                last_ts = 0.0
                 widgets = self._widgets
                 current = self._current
-                if 0 <= current < len(widgets):
+                if not widgets or current >= len(widgets):
+                    time.sleep(0.5); continue
+
+                if self._switch.is_set():
+                    self._switch.clear()
+                    last_mono = 0.0
+                    last_bg_ts = 0.0
+                    self._handle_switch()
+
+                w = widgets[current]
+                now = time.time()
+                mono = time.monotonic()
+                self.ctx.now = now
+                self.ctx.orientation = self.orientation
+                wctx = self._ctx_for(w)
+                wctx.now = now
+                wctx.orientation = self.orientation
+
+                need_render = (mono - last_mono >= w.interval)
+                need_bg = (self._bg_enabled and
+                           len(self.background.frames) > 1 and
+                           mono - last_bg_ts >= 0.1)
+                need_heartbeat = (not need_render and not need_bg and
+                                  mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
+
+                if need_render:
+                    last_mono = mono
+                    t0 = time.perf_counter()
                     try:
-                        widgets[current].on_enter(self.ctx)
+                        img = w.render(wctx)
                     except Exception as e:
-                        log.warning("on_enter %s 失败: %s",
-                                    widgets[current].name, e)
+                        log.exception("插件 %s 渲染异常: %s", w.name, e)
+                        img = None
+                        time.sleep(0.3)
+                    t1 = time.perf_counter()
+                    if img is not None:
+                        self._last_imgs[w.name] = img
+                    if need_bg:
+                        last_bg_ts = mono
+                    if img is not None or need_bg or self._force_send:
+                        frame = img if img is not None else self._last_imgs.get(w.name)
+                        if frame is not None or need_bg:
+                            if self.device.show_image(self._composite(frame, mono)):
+                                self._last_send_mono = mono
+                            self._force_send = False
+                    log.debug("渲染 %s: render=%.1fms total=%.1fms",
+                              w.name, (t1 - t0) * 1000.0,
+                              (time.perf_counter() - t0) * 1000.0)
+                elif need_bg:
+                    last_bg_ts = mono
+                    if self.device.show_image(
+                            self._composite(self._last_imgs.get(w.name), mono)):
+                        self._last_send_mono = mono
+                elif need_heartbeat:
+                    if self.device.heartbeat():
+                        self._last_send_mono = mono
 
-            w = widgets[current]
-            now = time.time()
-            self.ctx.now = now
-            self.ctx.orientation = self.orientation
+                if mono - self._touch_last_sample_ts >= TOUCH_SAMPLE_INTERVAL:
+                    self._touch_last_sample_ts = mono
+                    try:
+                        self._poll_touch(mono)
+                    except Exception as e:
+                        log.debug("触摸采样异常: %s", e)
 
-            need_render = (now - last_ts >= w.interval)
-            need_heartbeat = (not need_render and
-                              now - self._last_send_ts >= HEARTBEAT_INTERVAL)
+                time.sleep(0.005)
+        finally:
+            self._teardown_all()
+            log.info("Scheduler 退出")
 
-            if need_render:
-                last_ts = now
-                try:
-                    img = w.render(self.ctx)
-                    if img is None:
-                        pass
-                    else:
-                        final = self._composite(img)
-                        if self.device.show_image(final):
-                            self._last_send_ts = time.time()
-                except Exception as e:
-                    log.exception("插件 %s 渲染异常: %s", w.name, e)
-                    time.sleep(0.3)
-            elif need_heartbeat:
-                if self.device.heartbeat():
-                    self._last_send_ts = time.time()
+DEFAULT_CONFIG_PATH = str(_APP_DIR / "config.json")
 
-            if now - self._touch_last_sample_ts >= TOUCH_SAMPLE_INTERVAL:
-                self._touch_last_sample_ts = now
-                try:
-                    self._poll_touch(now)
-                except Exception as e:
-                    log.debug("触摸采样异常: %s", e)
+_CONFIG_LOCK = threading.RLock()
 
-            time.sleep(0.005)
-        log.info("Scheduler 退出")
+_TOUCH_ACTIONS = ("passthrough", "next_page", "prev_page", "flip",
+                  "toggle_orientation", "lock", "screenshot",
+                  "mute_toggle", "macro", "launch", "shutdown")
 
-DEFAULT_CONFIG_PATH = "./config.json"
+_TOUCH_DEFAULTS = {
+    "single": "passthrough",
+    "double": "passthrough",
+    "long":   "passthrough",
+    "macro_single": "",
+    "macro_double": "",
+    "macro_long":   "",
+    "program_single": "",
+    "program_double": "",
+    "program_long":   "",
+    "threshold": TOUCH_DEFAULT_THRESHOLD,
+}
 
 def _default_pages():
     names = list(WIDGET_REGISTRY.keys())
@@ -923,24 +1236,13 @@ def _base_default_config():
         "orientation": "landscape",
         "reverse": False,
         "portrait_rotate": -90,
-        "gif_dir": "./assets/gif",
-        "background": {"enabled": False, "path": ""},
+        "gif_dir": str(DEFAULT_GIF_DIR),
+        "background": {"enabled": False, "path": "", "mode": "fit"},
         "widget_config": {},
         "font": "",
         "web": {"host": "0.0.0.0", "port": 8765},
         "log_level": "INFO",
-        "touch": {
-            "single": "next_page",
-            "double": "toggle_orientation",
-            "long":   "toggle_reverse",
-            "macro_single": "",
-            "macro_double": "",
-            "macro_long":   "",
-            "program_single": "",
-            "program_double": "",
-            "program_long":   "",
-            "threshold": TOUCH_DEFAULT_THRESHOLD,
-        },
+        "touch": dict(_TOUCH_DEFAULTS),
     }
 
 def _widget_meta():
@@ -956,13 +1258,114 @@ def _widget_meta():
                 "priority": cls.priority,
                 "has_config": bool(getattr(cls, "config_schema", [])),
                 "actions": dict(getattr(cls, "actions", {}) or {}),
+                "source": "external" if str(getattr(cls, "__module__", "")).startswith("msu2_ext_widgets") else "builtin",
             }
         except Exception:
             meta[name] = {}
     return meta
 
-def ensure_config_file(path=DEFAULT_CONFIG_PATH):
+def _deep_fill(default, user):
+    out = dict(user) if isinstance(user, dict) else {}
+    for k, dv in default.items():
+        if k not in out:
+            out[k] = dv
+            continue
+        uv = out[k]
+        if isinstance(dv, dict):
+            out[k] = _deep_fill(dv, uv) if isinstance(uv, dict) else dict(dv)
+    return out
+
+def _sanitize_config(cfg):
+    cfg["port"] = str(cfg.get("port") or "auto")
+    pages = []
+    for name in cfg.get("pages") or []:
+        if isinstance(name, str) and name in WIDGET_REGISTRY and name not in pages:
+            pages.append(name)
+    cfg["pages"] = pages or _default_pages()
+    cur = cfg.get("current_page") or ""
+    if not isinstance(cur, str) or cur not in pages:
+        cur = ""
+    cfg["current_page"] = cur
+    if cfg.get("orientation") not in (LANDSCAPE, PORTRAIT):
+        cfg["orientation"] = LANDSCAPE
+    cfg["reverse"] = bool(cfg.get("reverse", False))
+    rotate = _coerce_int(cfg.get("portrait_rotate"), -90)
+    cfg["portrait_rotate"] = rotate if rotate in (90, -90) else -90
+    gif_dir = cfg.get("gif_dir")
+    cfg["gif_dir"] = gif_dir if isinstance(gif_dir, str) and gif_dir else str(DEFAULT_GIF_DIR)
+    bg = cfg.get("background")
+    if not isinstance(bg, dict):
+        bg = {}
+    cfg["background"] = {"enabled": bool(bg.get("enabled", False)),
+                         "path": str(bg.get("path") or ""),
+                         "mode": bg.get("mode") if bg.get("mode") in Background.MODES else "fit"}
+    wc = cfg.get("widget_config")
+    if not isinstance(wc, dict):
+        wc = {}
+    cfg["widget_config"] = {k: dict(v) for k, v in wc.items()
+                            if k in WIDGET_REGISTRY and isinstance(v, dict)}
+    font = cfg.get("font")
+    cfg["font"] = font if isinstance(font, str) else ""
+    web = cfg.get("web")
+    if not isinstance(web, dict):
+        web = {}
+    host = web.get("host")
+    cfg["web"] = {"host": host if isinstance(host, str) and host else "0.0.0.0",
+                  "port": _coerce_int(web.get("port"), 8765, 1, 65535)}
+    lvl = str(cfg.get("log_level") or "INFO").upper()
+    cfg["log_level"] = lvl if lvl in ("DEBUG", "INFO", "WARNING", "ERROR",
+                                      "CRITICAL") else "INFO"
+    tk = cfg.get("touch")
+    if not isinstance(tk, dict):
+        tk = {}
+    touch = {}
+    for k, dv in _TOUCH_DEFAULTS.items():
+        v = tk.get(k, dv)
+        if k == "threshold":
+            v = _coerce_int(v, TOUCH_DEFAULT_THRESHOLD, 5, 2000)
+        else:
+            v = v if isinstance(v, str) else ("" if v is None else str(v))
+            v = v.strip()
+        if k in ("single", "double", "long") and v not in _TOUCH_ACTIONS:
+            v = "passthrough"
+        touch[k] = v
+    cfg["touch"] = touch
+    return cfg
+
+def _write_config_raw(cfg, path):
     p = Path(path)
+    tmp = p.with_name(p.name + ".tmp")
+    data = json.dumps(cfg, indent=2, ensure_ascii=False)
+    with _CONFIG_LOCK:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(data, "utf-8")
+            os.replace(tmp, p)
+            return True
+        except Exception as e:
+            log.warning("写入配置失败 %s: %s", p, e)
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+            return False
+
+def _default_config_path():
+    p = Path(DEFAULT_CONFIG_PATH)
+    if p.exists():
+        return str(p)
+    legacy = Path("./config.json")
+    try:
+        if legacy.exists() and legacy.resolve() != p.resolve():
+            log.info("使用当前目录的配置文件: %s", legacy)
+            return str(legacy)
+    except Exception:
+        pass
+    return str(p)
+
+def ensure_config_file(path=None):
+    p = Path(path or DEFAULT_CONFIG_PATH)
     meta = _widget_meta()
     if not p.exists():
         cfg = _base_default_config()
@@ -974,61 +1377,46 @@ def ensure_config_file(path=DEFAULT_CONFIG_PATH):
             "reverse": "true=上下翻转（180°）",
             "portrait_rotate": "竖屏转横屏时的旋转角，-90 或 90",
             "gif_dir": "读取图片序列的目录",
-            "background": {"enabled": "背景图开关", "path": "背景图路径"},
-            "widget_config": "每个插件自己的配置（Web 里点 ⚙ 修改）",
+            "background": {"enabled": "背景图开关",
+                           "path": "背景图路径（图片、GIF 或图片序列目录）",
+                           "mode": "显示方式：fit=适应 / fill=填充 / stretch=拉伸"},
+            "widget_config": "每个插件自己的配置（Web 页面该行的 ⋯ 菜单里点「设置」修改）",
             "font": "自定义字体路径",
             "web": {"host": "WebUI 监听地址", "port": "WebUI 端口"},
             "log_level": "DEBUG / INFO / WARNING / ERROR",
-            "touch": "全局触控动作。三个都为 passthrough 时，动作透传给插件",
+            "touch": "全局触控动作。选 passthrough 的手势会透传给插件",
         }
         cfg["_available_widgets"] = meta
-        p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
+        _write_config_raw(cfg, p)
         log.info("已生成默认配置: %s", p)
         log.info("  可用插件: %s", ", ".join(meta.keys()))
         return cfg
     try:
+        if p.stat().st_size > MAX_CONFIG_BYTES:
+            raise ValueError("文件过大")
         user_cfg = json.loads(p.read_text("utf-8"))
         if not isinstance(user_cfg, dict):
             raise ValueError("顶层必须是对象")
     except Exception as e:
-        log.warning("配置解析失败 (%s)，重写默认: %s", e, p)
+        backup = p.with_name(p.name + ".bad")
+        try:
+            shutil.copy2(p, backup)
+            log.warning("配置解析失败 (%s)，已备份到 %s", e, backup)
+        except Exception:
+            log.warning("配置解析失败 (%s)，无法备份", e)
         cfg = _base_default_config(); cfg["_available_widgets"] = meta
-        p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
+        _write_config_raw(cfg, p)
         return cfg
 
-    merged = dict(user_cfg)
-    added = []
-    for k, v in _base_default_config().items():
-        if k not in merged:
-            merged[k] = v; added.append(k)
-
-    pages = [p for p in merged.get("pages", []) if p in WIDGET_REGISTRY]
-    if pages != merged.get("pages"):
-        merged["pages"] = pages
-
-    wc = merged.get("widget_config", {}) or {}
-    cleaned_wc = {k: v for k, v in wc.items() if k in WIDGET_REGISTRY}
-    if cleaned_wc != wc:
-        merged["widget_config"] = cleaned_wc
-        log.info("已清理 widget_config 中不存在的插件: %s",
-                 set(wc.keys()) - set(cleaned_wc.keys()))
-
-    if merged.get("current_page") and merged["current_page"] not in WIDGET_REGISTRY:
-        merged["current_page"] = ""
-
-    if merged.get("_available_widgets") != meta:
-        merged["_available_widgets"] = meta
-    p.write_text(json.dumps(merged, indent=2, ensure_ascii=False), "utf-8")
-    if added:
-        log.info("配置已补齐缺失项: %s", added)
+    merged = _sanitize_config(_deep_fill(_base_default_config(), user_cfg))
+    merged["_available_widgets"] = meta
+    if merged != user_cfg:
+        _write_config_raw(merged, p)
+        log.info("配置已规范化: %s", p)
     return merged
 
-def save_config(cfg, path=DEFAULT_CONFIG_PATH):
-    try:
-        Path(path).write_text(
-            json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
-    except Exception as e:
-        log.warning("保存配置失败: %s", e)
+def save_config(cfg, path=None):
+    _write_config_raw(cfg, path or DEFAULT_CONFIG_PATH)
 
 def discover_and_open():
     ports = list(serial.tools.list_ports.comports())
@@ -1079,6 +1467,9 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       font-size: 12px; overflow: auto; max-height: 15em;
       white-space: pre-wrap; }
 .msg { font-size: 12px; color: #080; margin-left: .6em; }
+.hint { font-size: 12px; color: #444; background: #f2f5fa; border: 1px solid #dde3ee;
+        border-radius: 6px; padding: 6px 8px; margin: 0 0 10px; display: none; }
+.tiny { font-size: 11px; color: #999; margin: 4px 0 0; }
 .msg.err { color: #c00; }
 .plist { border: 1px solid #ddd; background: #fff; border-radius: 3px;
          padding: 4px 6px; }
@@ -1087,11 +1478,22 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 .pitem:last-child { border-bottom: 0; }
 .pitem .name { flex: 1; padding-left: 6px; }
 .pitem .tags { color: #888; font-size: 11px; margin-left: 6px; }
+.pitem .tag-ext { background: #eef3ff; color: #2b5fd9; border: 1px solid #b9cdf5;
+  border-radius: 3px; font-size: 10px; padding: 0 4px; margin-left: 4px; }
 .pitem.empty { color: #999; font-style: italic; padding: 6px 8px; }
 .pitem.current { background: #e8f0ff; }
 .pitem.current .name { font-weight: bold; color: #2b5fd9; }
 .pitem.current .name::before { content: '▶ '; color: #2b5fd9; }
-.pitem .actions { margin-left: auto; display: flex; gap: 4px; }
+.pitem .actbtn { margin-left: 4px; padding: 0 6px; line-height: 17px; }
+.actpop { position: absolute; z-index: 90; min-width: 130px;
+          background: #fff; border: 1px solid #aaa; border-radius: 4px;
+          box-shadow: 0 4px 14px rgba(0,0,0,.18); padding: 4px; }
+.actpop .ttl { font-size: 11px; color: #888; padding: 2px 6px 4px;
+               border-bottom: 1px solid #eee; margin-bottom: 3px; }
+.actpop button { display: block; width: 100%; text-align: left;
+                 margin: 2px 0; padding: 4px 10px; font-size: 13px;
+                 border: 0; background: #f4f4f4; }
+.actpop button:hover { background: #e4e4e4; }
 .card { background: #fff; border: 1px solid #ddd; border-radius: 4px;
         padding: 10px 12px; margin-bottom: 12px; }
 .field { margin: 8px 0; }
@@ -1125,7 +1527,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <div class="card">
   <h2>全局触控</h2>
   <div class="hint">
-    三个都为"未定义"时，手势才会透传给插件<br>
+    选"未定义（透传给插件）"的手势会直接交给当前插件处理，各插件支持的手势见它的设置面板<br>
     自定义程序：支持完整路径和环境变量<br>
     键盘宏示例：<code>ctrl+shift+s</code>、<code>alt+f4</code>、<code>win+r</code>
   </div>
@@ -1156,6 +1558,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <div class="card">
   <h2>页面顺序</h2>
   <div class="plist" id="pages-list"></div>
+  <div class="tiny">拖拽页面行可排序；双击页面名可立即切换到该页。</div>
   <div style="margin-top:.4em">
     <button onclick="loadPages()">刷新列表</button>
     <button onclick="post('/api/reload')">重载插件</button>
@@ -1165,6 +1568,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 
 <div class="card" id="config-panel" style="display:none">
   <h2 id="config-title">配置</h2>
+  <div id="config-hint" class="hint"></div>
   <div id="config-body"></div>
   <div style="margin-top:.8em">
     <button onclick="saveConfig()">保存</button>
@@ -1177,6 +1581,15 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
   <h2>背景图</h2>
   <div>
     <input type="text" id="bg-path" placeholder="path/to/image.gif|png|jpg" style="width:22em">
+  </div>
+  <div style="margin-top:4px">
+    <label style="font-size:12px;color:#666">显示方式
+      <select id="bg-mode" onchange="setBackgroundMode()">
+        <option value="fit">适应</option>
+        <option value="fill">填充</option>
+        <option value="stretch">拉伸</option>
+      </select>
+    </label>
   </div>
   <div style="margin-top:4px">
     <button id="btn-bg" onclick="toggleBackground()">启用背景</button>
@@ -1201,6 +1614,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <script>
 let currentPages = [];
 let allWidgets = {};
+let allBgEnabled = false;
 let configWidgetName = '';
 let currentWidgetName = '';
 
@@ -1224,6 +1638,16 @@ function fillTouchSelect(sel) {
     const o = document.createElement('option');
     o.value = v; o.textContent = l;
     sel.appendChild(o);
+  });
+}
+
+function syncTouchSelects(t) {
+  ['single', 'double', 'long'].forEach(k => {
+    const sel = document.getElementById('tk-' + k);
+    if (!sel || !sel.options.length) return;
+    if (document.activeElement === sel) return;
+    const v = t[k];
+    if (v && sel.value !== v) sel.value = v;
   });
 }
 
@@ -1296,6 +1720,12 @@ async function getJSON(url, opts) {
   return r.json();
 }
 
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[c]));
+}
+
 function setMsg(id, text, isErr) {
   const el = document.getElementById(id);
   el.textContent = text;
@@ -1317,6 +1747,12 @@ async function refresh() {
     const bgBtn = document.getElementById('btn-bg');
     bgBtn.textContent = j.background_enabled ? '关闭背景' : '启用背景';
     bgBtn.classList.toggle('active', !!j.background_enabled);
+    allBgEnabled = !!j.background_enabled;
+    const bgModeEl = document.getElementById('bg-mode');
+    if (bgModeEl && document.activeElement !== bgModeEl) {
+      bgModeEl.value = j.background_mode || 'fit';
+    }
+    syncTouchSelects(j.touch || {});
 
     currentWidgetName = j.current_widget || '';
     document.querySelectorAll('#pages-list .pitem').forEach(el => {
@@ -1337,6 +1773,7 @@ async function loadPages() {
 
 function renderPages() {
   const box = document.getElementById('pages-list');
+  closeActMenu();
   box.innerHTML = '';
 
   if (currentPages.length === 0) {
@@ -1351,28 +1788,52 @@ function renderPages() {
     const row = document.createElement('div');
     row.className = 'pitem';
     row.dataset.widget = name;
+    row.draggable = true;
     if (name === currentWidgetName) row.classList.add('current');
 
-    const cfgBtn = w.has_config
-      ? `<button class="mini" onclick="openConfig('${name}')">⚙</button>`
+    row.addEventListener('dragstart', ev => {
+      dragIndex = i;
+      ev.dataTransfer.effectAllowed = 'move';
+      try { ev.dataTransfer.setData('text/plain', name); } catch(e) {}
+    });
+    row.addEventListener('dragend', () => { dragIndex = null; });
+    row.addEventListener('dragover', ev => {
+      ev.preventDefault();
+      ev.dataTransfer.dropEffect = 'move';
+      if (dragIndex !== null && dragIndex !== i) row.style.borderTop = '2px solid #2b5fd9';
+    });
+    row.addEventListener('dragleave', () => { row.style.borderTop = ''; });
+    row.addEventListener('drop', ev => {
+      ev.preventDefault();
+      row.style.borderTop = '';
+      dragMove(i);
+    });
+    row.addEventListener('dblclick', ev => {
+      if (ev.target.closest('button')) return;
+      switchTo(name);
+    });
+
+    const cfgBtn = '';
+    const actCount = (w.has_config ? 1 : 0) +
+                     Object.keys(w.actions || {}).length;
+    const actBtn = actCount > 0
+      ? `<button class="mini actbtn" title="插件动作" ` +
+        `onclick="toggleActMenu(event,'${esc(name)}')">⋯</button>`
       : '';
 
-    let actionBtns = '';
-    if (w.actions && Object.keys(w.actions).length) {
-      actionBtns = '<span class="actions">' +
-        Object.entries(w.actions).map(([a, label]) =>
-          `<button class="mini" onclick="doAction('${name}','${a}')">${label}</button>`
-        ).join('') + '</span>';
-    }
+    const nameTag = w.source === 'external'
+      ? `<span class="name" title="双击切换到该页">${esc(name)}</span>` +
+        `<span class="tag-ext" title="外挂插件">外挂</span>`
+      : `<span class="name" title="双击切换到该页">${esc(name)}</span>`;
 
     row.innerHTML =
       `<button class="mini" onclick="moveUp(${i})" ${i===0?'disabled':''}>↑</button>` +
       `<button class="mini" onclick="moveDown(${i})" ${i===currentPages.length-1?'disabled':''}>↓</button>` +
       `<button class="mini" onclick="removeAt(${i})">×</button>` +
       cfgBtn +
-      `<span class="name">${name}</span>` +
-      `<span class="tags">[${(w.orientations||[]).join('/')}]</span>` +
-      actionBtns;
+      nameTag +
+      actBtn +
+      `<span class="tags">[${(w.orientations||[]).join('/')}]</span>`;
     box.appendChild(row);
   });
 
@@ -1391,12 +1852,67 @@ function renderPages() {
       row.className = 'pitem';
       row.style.opacity = '0.6';
       row.innerHTML =
-        `<button class="mini" onclick="addWidget('${name}')">+</button>` +
-        `<span class="name">${name}</span>` +
+        `<button class="mini" onclick="addWidget('${esc(name)}')">+</button>` +
+        `<span class="name">${esc(name)}</span>` +
         `<span class="tags">[${(w.orientations||[]).join('/')}]</span>`;
       box.appendChild(row);
     });
   }
+}
+
+let actMenu = null;
+let dragIndex = null;
+
+function closeActMenu() {
+  if (!actMenu) return;
+  actMenu.remove();
+  actMenu = null;
+}
+
+function placeActMenu(box, btn) {
+  const r = btn.getBoundingClientRect();
+  const bw = box.offsetWidth, bh = box.offsetHeight;
+  const sx = window.scrollX || window.pageXOffset || 0;
+  const sy = window.scrollY || window.pageYOffset || 0;
+  let left = r.right + sx + 6;
+  if (left + bw > sx + window.innerWidth - 8) left = r.left + sx - bw - 6;
+  if (left < sx + 8) left = sx + Math.max(8, window.innerWidth - bw - 8);
+  let top = r.top + sy + r.height / 2 - bh / 2;
+  if (top < sy + 8) top = sy + 8;
+  box.style.left = left + 'px';
+  box.style.top = top + 'px';
+}
+
+function toggleActMenu(ev, name) {
+  ev.stopPropagation();
+  if (ev.preventDefault) ev.preventDefault();
+  const btn = ev.currentTarget;
+  const same = actMenu && actMenu.dataset.widget === name;
+  closeActMenu();
+  if (same) return;
+  const w = allWidgets[name] || {};
+  const entries = [];
+  if (w.has_config) entries.push(['__cfg__', '设置']);
+  Object.entries(w.actions || {}).forEach(([a, label]) => entries.push([a, label]));
+  if (!entries.length) return;
+  const box = document.createElement('div');
+  box.className = 'actpop';
+  box.dataset.widget = name;
+  const ttl = document.createElement('div');
+  ttl.className = 'ttl';
+  ttl.textContent = name;
+  box.appendChild(ttl);
+  entries.forEach(([act, label]) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = () => {
+      if (act === '__cfg__') openConfig(name); else doAction(name, act);
+    };
+    box.appendChild(b);
+  });
+  document.body.appendChild(box);
+  placeActMenu(box, btn);
+  actMenu = box;
 }
 
 async function pushPages(newPages) {
@@ -1441,6 +1957,48 @@ function addWidget(name) {
   p.push(name);
   pushPages(p);
 }
+function dragMove(target) {
+  if (dragIndex === null || target === null) return;
+  if (dragIndex === target) return;
+  if (dragIndex < 0 || dragIndex >= currentPages.length) return;
+  const p = currentPages.slice();
+  const [item] = p.splice(dragIndex, 1);
+  p.splice(target, 0, item);
+  dragIndex = null;
+  pushPages(p);
+}
+async function switchTo(name) {
+  try {
+    const j = await getJSON('/api/switch', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name: name})
+    });
+    if (j.ok) setMsg('msg-pages', '已切换到 ' + name, false);
+    else setMsg('msg-pages', j.err || '切换失败', true);
+  } catch(e) {
+    setMsg('msg-pages', '切换失败: ' + e, true);
+  }
+  setTimeout(refresh, 200);
+}
+async function setBackgroundMode() {
+  const modeEl = document.getElementById('bg-mode');
+  const mode = modeEl ? modeEl.value : 'fit';
+  const path = (document.getElementById('bg-path') || {}).value || '';
+  const enabled = !!allBgEnabled;
+  try {
+    const j = await getJSON('/api/background', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({enabled: enabled, path: path.trim(), mode: mode})
+    });
+    if (j.ok) setMsg('msg-bg', '显示方式已更新', false);
+    else setMsg('msg-bg', j.err || '被拒绝', true);
+  } catch(e) {
+    setMsg('msg-bg', '失败: ' + e, true);
+  }
+  setTimeout(refresh, 200);
+}
 
 async function doAction(name, action) {
   setMsg('msg-pages', '执行中...', false);
@@ -1465,6 +2023,13 @@ async function openConfig(name) {
     configWidgetName = name;
 
     document.getElementById('config-title').textContent = `配置: ${name}`;
+    const hint = document.getElementById('config-hint');
+    if (hint) {
+      const parts = [];
+      if (j.touch_help) parts.push('透传触控：' + j.touch_help);
+      hint.textContent = parts.length ? parts.join('　|　') : '';
+      hint.style.display = parts.length ? 'block' : 'none';
+    }
     const box = document.getElementById('config-body');
     box.innerHTML = '';
 
@@ -1582,6 +2147,8 @@ async function toggleBackground() {
   const currentlyOn = btn.classList.contains('active');
   const next = !currentlyOn;
   const path = document.getElementById('bg-path').value.trim();
+  const modeEl = document.getElementById('bg-mode');
+  const mode = modeEl ? modeEl.value : 'fit';
 
   if (next && !path) {
     setMsg('msg-bg', '请先填写图片路径', true);
@@ -1592,7 +2159,7 @@ async function toggleBackground() {
     const j = await getJSON('/api/background', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: next, path})
+      body: JSON.stringify({enabled: next, path, mode})
     });
     if (j.ok) setMsg('msg-bg', next ? '已启用' : '已关闭', false);
     else setMsg('msg-bg', j.err || '被拒绝', true);
@@ -1643,6 +2210,46 @@ setInterval(refresh, 1000);
 </html>
 """
 
+def _check_path(path, exts, max_bytes):
+    try:
+        p = Path(str(path)).expanduser()
+    except Exception:
+        return False, "路径无效"
+    try:
+        if not p.exists():
+            return True, ""
+        if p.is_dir():
+            for f in list(p.iterdir())[:200]:
+                if f.is_file() and f.suffix.lower() not in exts:
+                    return False, "目录含不支持的文件: %s" % f.name
+            return True, ""
+        if p.suffix.lower() not in exts:
+            return False, "不支持的扩展名: %s" % (p.suffix or "无")
+        if p.stat().st_size > max_bytes:
+            return False, "文件过大: %s" % p.name
+    except Exception:
+        return False, "无法读取文件"
+    return True, ""
+
+def _check_widget_values(schema, values):
+    for f in schema:
+        key = getattr(f, "key", None)
+        if not isinstance(key, str) or not isinstance(values, dict):
+            continue
+        if not (key == "path" or key.endswith("_path") or key.endswith("_dir")):
+            continue
+        v = values.get(key)
+        if not isinstance(v, str) or not v:
+            continue
+        if key.endswith("_dir") or Path(v).suffix.lower() in IMAGE_EXTS:
+            ok, err = _check_path(v, IMAGE_EXTS, MAX_RESOURCE_BYTES)
+        else:
+            ok, err = _check_path(v, TEXT_EXTS + IMAGE_EXTS, MAX_TEXT_BYTES)
+        if not ok:
+            label = getattr(f, "label", "") or key
+            return False, "%s: %s" % (label, err)
+    return True, ""
+
 class WebUI(threading.Thread):
     def __init__(self, scheduler, cfg, cfg_path, on_shutdown=None):
         super().__init__(daemon=True, name="WebUI")
@@ -1650,8 +2257,11 @@ class WebUI(threading.Thread):
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.on_shutdown = on_shutdown
-        self.host = cfg["web"]["host"]
-        self.port = cfg["web"]["port"]
+        web = cfg.get("web")
+        if not isinstance(web, dict):
+            web = {}
+        self.host = web.get("host") or "0.0.0.0"
+        self.port = _coerce_int(web.get("port"), 8765, 1, 65535)
         self._stop = threading.Event()
 
     def stop(self):
@@ -1683,12 +2293,21 @@ class WebUI(threading.Thread):
                 self._send(text.encode(), "text/html; charset=utf-8")
 
             def _read_json(self):
-                n = int(self.headers.get("Content-Length", "0") or 0)
+                n = _coerce_int(self.headers.get("Content-Length"), 0, 0)
                 if n <= 0: return {}
+                if n > MAX_REQUEST_BYTES:
+                    raise ValueError("请求体过大: %d 字节" % n)
                 try:
-                    return json.loads(self.rfile.read(n).decode("utf-8"))
+                    self.connection.settimeout(5.0)
+                    raw = self.rfile.read(n)
                 except Exception:
                     return {}
+                if len(raw) != n: return {}
+                try:
+                    obj = json.loads(raw.decode("utf-8"))
+                except Exception:
+                    return {}
+                return obj if isinstance(obj, dict) else {}
 
             def do_GET(self):
                 parsed = urlparse(self.path)
@@ -1711,17 +2330,22 @@ class WebUI(threading.Thread):
                         "locked": sched._locked,
                         "background_enabled": sched._bg_enabled,
                         "background_path": sched._bg_path,
+                        "background_mode": sched._bg_mode,
+                        "touch": dict(sched._touch_cfg),
                     }); return
 
                 if path == "/api/widgets":
                     self._json({
+                        "ok": True,
                         "widgets": [
                             {"name": n,
                              "orientations": list(c.orientations),
                              "interval": c.interval,
                              "priority": c.priority,
                              "has_config": bool(getattr(c, "config_schema", [])),
-                             "actions": dict(getattr(c, "actions", {}) or {})}
+                             "actions": dict(getattr(c, "actions", {}) or {}),
+                             "touch_help": str(getattr(c, "touch_help", "") or ""),
+                             "source": "external" if str(getattr(c, "__module__", "")).startswith("msu2_ext_widgets") else "builtin"}
                             for n, c in sorted(WIDGET_REGISTRY.items())
                         ],
                         "active": cfg.get("pages", []),
@@ -1733,32 +2357,28 @@ class WebUI(threading.Thread):
                     cls = WIDGET_REGISTRY.get(name)
                     if not cls:
                         self._json({"ok": False, "err": "未知插件"}); return
-                    schema = getattr(cls, "config_schema", [])
+                    obj = cls
+                    for w in sched._widgets:
+                        if w.name == name:
+                            obj = w
+                            break
+                    schema = getattr(obj, "config_schema", [])
                     user = cfg.get("widget_config", {}).get(name, {})
                     values = merge_config(schema, user)
                     self._json({
                         "ok": True, "name": name,
                         "schema": [f.to_dict() for f in schema],
                         "values": values,
+                        "touch_help": str(getattr(obj, "touch_help", "") or ""),
+                        "actions": dict(getattr(obj, "actions", {}) or {}),
                     }); return
 
                 if path == "/api/touch_config":
                     tk = cfg.get("touch", {}) or {}
-                    self._json({
-                        "ok": True,
-                        "values": {
-                            "single": tk.get("single", "next_page"),
-                            "double": tk.get("double", "toggle_orientation"),
-                            "long":   tk.get("long",   "toggle_reverse"),
-                            "macro_single": tk.get("macro_single", ""),
-                            "macro_double": tk.get("macro_double", ""),
-                            "macro_long":   tk.get("macro_long", ""),
-                            "program_single": tk.get("program_single", ""),
-                            "program_double": tk.get("program_double", ""),
-                            "program_long":   tk.get("program_long", ""),
-                            "threshold":    tk.get("threshold", TOUCH_DEFAULT_THRESHOLD),
-                        },
-                    }); return
+                    vals = {}
+                    for k, dv in _TOUCH_DEFAULTS.items():
+                        vals[k] = tk.get(k, dv)
+                    self._json({"ok": True, "values": vals}); return
 
                 self.send_error(404)
 
@@ -1790,24 +2410,43 @@ class WebUI(threading.Thread):
                         body = self._read_json()
                         pages = [p for p in body.get("pages", [])
                                  if p in WIDGET_REGISTRY]
-                        ok = sched.set_pages(pages)
-                        if ok:
-                            cfg["pages"] = pages
-                            save_config(cfg, cfg_path)
-                        self._json({"ok": ok, "pages": pages,
-                                    "err": "" if ok else "拒绝"})
+                        applied = sched.set_pages(pages)
+                        cfg["pages"] = applied
+                        save_config(cfg, cfg_path)
+                        self._json({"ok": True, "pages": applied, "err": ""})
                     elif self.path == "/api/background":
                         body = self._read_json()
                         enabled = bool(body.get("enabled", False))
                         path = str(body.get("path", "") or "")
+                        mode = body.get("mode")
+                        if mode not in Background.MODES:
+                            mode = None
                         if not enabled and not path:
-                            path = cfg.get("background", {}).get("path", "")
-                        sched.set_background(enabled, path)
-                        cfg.setdefault("background", {})
-                        cfg["background"]["enabled"] = enabled
-                        cfg["background"]["path"] = path
+                            bg = cfg.get("background")
+                            path = (bg or {}).get("path", "") if isinstance(bg, dict) else ""
+                        if path:
+                            vok, verr = _check_path(path, IMAGE_EXTS,
+                                                    MAX_RESOURCE_BYTES)
+                            if not vok:
+                                self._json({"ok": False, "err": verr}); return
+                        sched.set_background(enabled, path, mode)
+                        bgcfg = cfg.get("background")
+                        if not isinstance(bgcfg, dict):
+                            bgcfg = {}
+                            cfg["background"] = bgcfg
+                        bgcfg["enabled"] = enabled
+                        bgcfg["path"] = path
+                        if mode:
+                            bgcfg["mode"] = mode
                         save_config(cfg, cfg_path)
-                        self._json({"ok": True, "enabled": enabled, "path": path})
+                        self._json({"ok": True, "enabled": enabled, "path": path,
+                                    "mode": bgcfg.get("mode", "fit")})
+                    elif self.path == "/api/switch":
+                        body = self._read_json()
+                        name = str(body.get("name", ""))
+                        ok = sched.switch_to(name)
+                        self._json({"ok": ok, "current": name,
+                                    "err": "" if ok else "插件未启用"})
                     elif self.path == "/api/widget_config":
                         body = self._read_json()
                         name = str(body.get("name", ""))
@@ -1815,8 +2454,14 @@ class WebUI(threading.Thread):
                         cls = WIDGET_REGISTRY.get(name)
                         if not cls:
                             self._json({"ok": False, "err": "未知插件"}); return
-                        schema = getattr(cls, "config_schema", [])
+                        live = sched.find_widget(name)
+                        schema = getattr(live or cls, "config_schema", [])
+                        if not isinstance(values, dict):
+                            values = {}
                         merged = merge_config(schema, values)
+                        vok, verr = _check_widget_values(schema, merged)
+                        if not vok:
+                            self._json({"ok": False, "err": verr}); return
                         cfg.setdefault("widget_config", {})
                         cfg["widget_config"][name] = merged
                         save_config(cfg, cfg_path)
@@ -1832,7 +2477,7 @@ class WebUI(threading.Thread):
                             self._json({"ok": False,
                                         "err": "插件未启用"}); return
                         try:
-                            result = w.on_action(action, payload, sched.ctx)
+                            result = w.on_action(action, payload, sched._ctx_for(w))
                             if not isinstance(result, dict):
                                 result = {"ok": True}
                             if result.get("ok"):
@@ -1891,17 +2536,38 @@ def cmd_plugins():
     if not WIDGET_REGISTRY:
         print("未发现任何插件。")
         return
-    print(f"{'NAME':<18} {'ORI':<22} {'PRI':<5} {'DESC'}")
-    print("-" * 80)
+    try:
+        ext = _widgets_pkg.external_report()
+    except Exception:
+        ext = {}
+    for folder in ext.get("dirs") or []:
+        print(f"外挂插件目录: {folder}")
+    if ext.get("failed"):
+        print(f"外挂插件加载失败 {len(ext['failed'])} 个: {ext['failed']}")
+    print(f"{'NAME':<18} {'ORI':<22} {'PRI':<5} {'SRC':<6} {'DESC'}")
+    print("-" * 86)
     rows = sorted(WIDGET_REGISTRY.items(),
                   key=lambda kv: (kv[1].priority, kv[0]))
     for name, cls in rows:
         ori = "/".join(cls.orientations)
         doc = (cls.__doc__ or "").strip().splitlines()
         desc = doc[0].strip() if doc else ""
-        print(f"{name:<18} {ori:<22} {cls.priority:<5} {desc}")
+        src = "外挂" if str(getattr(cls, "__module__", "")).startswith("msu2_ext_widgets") else "内置"
+        print(f"{name:<18} {ori:<22} {cls.priority:<5} {src:<6} {desc}")
+
+def _setup_stdio():
+    for stream in (sys.stdout, sys.stderr):
+        if stream is None:
+            continue
+        try:
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 
 def main(argv=None):
+    _setup_stdio()
     ap = argparse.ArgumentParser(description="MSU2_MINI_Console")
     ap.add_argument("--config")
     ap.add_argument("--init-config", action="store_true")
@@ -1911,6 +2577,8 @@ def main(argv=None):
     ap.add_argument("--plugins", action="store_true",
                     help="列出所有已发现的插件后退出")
     ap.add_argument("--log", default=None)
+    ap.add_argument("--log-level", default=None)
+    ap.add_argument("--log-file", default=None)
     args = ap.parse_args(argv)
 
     if args.list:
@@ -1918,13 +2586,30 @@ def main(argv=None):
     if args.plugins:
         cmd_plugins(); return 0
 
+    stream = sys.stderr
+    if stream is None:
+        stream = sys.stdout
+    if stream is None:
+        try:
+            stream = open(os.devnull, "w", encoding="utf-8")
+        except Exception:
+            stream = None
+    handlers = [logging.StreamHandler(stream)]
+    if args.log_file:
+        try:
+            handlers.append(logging.FileHandler(args.log_file, encoding="utf-8"))
+        except Exception:
+            _console("无法写入日志文件: %s" % args.log_file)
+
     logging.basicConfig(
-        level=getattr(logging, (args.log or "INFO").upper(), logging.INFO),
+        level=getattr(logging, (args.log or args.log_level or "INFO").upper(),
+                      logging.INFO),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
+        handlers=handlers,
     )
 
-    cfg_path = args.config or DEFAULT_CONFIG_PATH
+    cfg_path = args.config or _default_config_path()
     if args.init_config:
         p = Path(cfg_path)
         if p.exists():
@@ -1932,17 +2617,30 @@ def main(argv=None):
             except Exception: pass
 
     cfg = ensure_config_file(cfg_path)
-    level_name = (args.log or cfg.get("log_level", "INFO")).upper()
+    level_name = (args.log or args.log_level
+                  or cfg.get("log_level", "INFO")).upper()
     logging.getLogger().setLevel(getattr(logging, level_name, logging.INFO))
 
     fi = probe_fonts()
     log.info("字体目录: %s", fi["font_dirs"])
-    log.info("CJK 字体: %s", fi["cjk"])
-    log.info("Latin 字体: %s", fi["latin"])
+    log.info("常规字重: %s", fi["cjk"])
+    log.info("粗体字重: %s", fi["latin"])
     if cfg.get("font"):
         set_user_font(cfg["font"])
 
     log.info("已注册插件: %s", list(WIDGET_REGISTRY.keys()))
+    try:
+        ext = _widgets_pkg.external_report()
+    except Exception:
+        ext = {}
+    for folder in ext.get("dirs") or []:
+        log.info("外部插件目录: %s", folder)
+    if ext.get("loaded"):
+        log.info("外部插件加载 %d 个: %s", len(ext["loaded"]),
+                 ", ".join(ext["loaded"]))
+    if ext.get("failed"):
+        log.warning("外部插件加载失败 %d 个: %s", len(ext["failed"]),
+                    ext["failed"])
 
     port = args.port or cfg.get("port")
     if not port or port == "auto":
@@ -1997,6 +2695,10 @@ def main(argv=None):
         except Exception: pass
         sched.stop()
         if web: web.stop()
+        try:
+            sched.join(timeout=3.0)
+        except Exception:
+            pass
         device.close()
     return 0
 
