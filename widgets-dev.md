@@ -115,7 +115,7 @@ class Widget:
 
 ## 5. 声明式配置：`config_schema`
 
-只要在 Widget 类里声明 `config_schema`，Web 上会自动出现 ⚙ 按钮，点开就是一个表单。
+只要在 Widget 类里声明 `config_schema`，Web 上该插件的 `⋯` 菜单里就会自动出现 `设置`，点开就是一个表单。
 
 ```python
 from msu2_core import Field
@@ -176,11 +176,44 @@ class PomodoroWidget(Widget):
         return {"ok": False, "err": f"未知动作 {action}"}
 ```
 
-保存后 Web 页面上会看到"开始"、"停止"两个按钮。
+保存后 Web 页面每一行的 `⋯` 菜单里会出现"开始"、"停止"两个动作（和 `设置` 并列）。
 
 **注意**：`on_action` 执行完，主程序会自动设一次 `_switch`，让 Scheduler 下一轮**立即重绘**（不需要等 interval）。所以按钮按下后屏幕几乎立刻变化。
 
 `payload` 参数留给未来扩展（比如带参数的动作），目前是 `{}`。
+
+### 6.1 循环浏览（多条目插件用）
+
+想让一个页面上轮流显示多条内容，只需要在 `config_schema` 里加两个字段，并把翻页动作接上：
+
+```python
+config_schema = [
+    Field("cycle", "bool", "循环浏览", default=False),
+    Field("cycle_interval", "float", "切换周期(秒)", default=5.0, min=2, max=3600),
+]
+
+actions = {"next": "下一个", "prev": "上一个"}
+
+def on_action(self, action, payload, ctx):
+    if action in ("next", "prev", "touch_single", "touch_double"):
+        self._step(ctx, 1 if action in ("next", "touch_single") else -1)
+        return {"ok": True}
+    return {"ok": False, "err": "未知动作"}
+```
+
+计时必须用 `time.monotonic()`（墙钟被改动时不会卡住），并在状态里记住上次切换的单调时刻。
+
+### 6.2 长文本滚动
+
+`widgets/_util.py` 提供三个工具，用来替代"省略号截断"：
+
+```python
+from ._util import row_text, ellipsis, text_w
+
+row_text(img, (x, y), 长文本, font, "#cccccc", max_w, ctx.now, scroll=True)
+```
+
+`scroll=True` 时超出 `max_w` 的文字会匀速滚动（`ctx.now` 驱动，帧缓存要把它算进 key）；`scroll=False` 时用 `ellipsis` 截断；`text_w(font, text)` 量宽、`ellipsis` 二分求最短可显示前缀。
 
 ## 7. 硬件触控支持
 
@@ -190,8 +223,8 @@ MSU2_MINI 面板上有一个触摸按键，可以识别三种手势——**单�
 
 主程序有两种模式处理触控：
 
-- **透传模式**：当「全局触控」的三个手势都选 `未定义（透传给插件）` 时，触控事件被转发给**当前显示的插件**，通过 `on_action` 送到你手里。
-- **全局模式**：任意一个手势选了具体动作，则所有触控走主程序全局定义，插件不再收到事件。
+- **透传模式**：某个手势选 `未定义（透传给插件）` 时，这个手势的触控事件被转发给**当前显示的插件**，通过 `on_action` 送到你手里。
+- **全局模式**：该手势选了具体动作，则这个手势走主程序全局定义。两种模式可以按手势混用。
 
 **为什么这样设计**：屏幕只有一个键，全局定义是"系统级操作"（翻页 / 翻转 / 关机等），透传是"内容级操作"（切歌 / 勾选待办等）。用户根据使用场景自行选择。
 
@@ -204,6 +237,12 @@ MSU2_MINI 面板上有一个触摸按键，可以识别三种手势——**单�
 | `touch_single` | 单击（按下-松开，间隔 < 800ms，且 350ms 内无第二次按下） |
 | `touch_double` | 双击（350ms 内连按两次） |
 | `touch_long` | 长按（按住 ≥ 800ms） |
+
+用类属性 `touch_help` 声明这些手势在你插件里的含义，它会显示在 Web 的配置面板顶部：
+
+```python
+touch_help = "单击=下一个，双击=上一个，长按=勾选/取消"
+```
 
 **注意**：单击有 350ms 的延迟——因为主程序要等双击窗口关闭才能确定不是双击。这是判定逻辑的必然结果。
 
@@ -327,10 +366,14 @@ img = Image.new("RGBA", (W, H), (0, 0, 0, 255))
 ```python
 from msu2_core import get_font
 
-f = get_font(20)                    # 中英文都支持，自动找系统字体
-f = get_font(20, bold=True)         # 粗体
-f = get_font(20, cjk=False)         # 只含 ASCII 的字体，等宽，适合数字
+f = get_font(20)                    # 内置 Noto Sans Mono CJK SC，中英文都支持
+f = get_font(20, bold=True)         # 粗体（内置 Bold 字重）
+f = get_font(20, cjk=False)         # 参数仅保留兼容，字体同上
 ```
+
+字体固定为随程序分发的 **Noto Sans Mono CJK SC**（`assets/fonts/`，SIL OFL 1.1），
+不依赖系统字体，各平台渲染结果一致，数字与英文都是等宽的。
+`cjk` 参数只为兼容旧代码保留，两种取值使用同一字体。
 
 **字体有缓存**，可以在 `render` 里反复调用 `get_font`，应该不会有性能问题。
 
@@ -409,7 +452,7 @@ python msu2_mini.py --log DEBUG
 会看到：
 
 - 每个插件注册成功/失败
-- 每帧渲染耗时
+- 每帧渲染耗时（`渲染 <插件名>: render=NN.Nms total=NN.Nms`）
 - 心跳发送
 - 切页动作
 - 触摸手势识别（`触摸: 单击` / `触摸: 双击` / `触摸: 长按`）
@@ -420,7 +463,8 @@ python msu2_mini.py --log DEBUG
 - `插件 XXX setup 失败: ...` → setup 里抛异常了，插件仍会加载但可能渲染不出来
 - `插件 XXX 渲染异常: ...` → render 里抛异常了，主循环会打日志并继续下一个
 - `插件 XXX touch_single 失败: ...` → `on_action` 里抛异常了
-- `WMI 数据源: ...` → sensors 插件找到了数据源
+- `配置解析失败 (...)，已备份到 ...` → config.json 坏了，旧文件被另存为 `.bad` 后重建
+- `Web UI 启动失败: ...` → 端口被占用，换一个 `web.port` 再启动
 
 **在插件里输出日志**：
 
@@ -453,5 +497,76 @@ log.info("我的日志")
 如果没按也一直输出，说明 `threshold` 太小，改大。
 
 具体数值观察方法：加 `--log DEBUG`，日志里会打每次采样的 ADC 值（`touch adc=NNNN base=NNNN`），看按下和松开时的差值。
+
+## 11. 外挂插件（不重新打包）
+
+插件可以放在**程序目录外面**，这样单文件 exe 不用重新打包就能加插件。
+
+### 11.1 目录
+
+程序启动时会按顺序扫这些目录，**找到的全部加载**：
+
+| 顺序 | 目录 | 说明 |
+| --- | --- | --- |
+| 1 | `%MSU2_WIDGETS_DIR%` | 环境变量，多个目录用系统路径分隔符（Windows `;`，Linux `:`） |
+| 2 | `<exe 所在目录>/widgets/` | 最常用的一个，直接把插件丢在 exe 旁边 |
+| 3 | `%LOCALAPPDATA%\MSU2_MINI\widgets\` | 用户级目录，exe 放 Program Files 没有写权限时用 |
+
+源码方式运行（`python msu2_mini.py`）时，`widgets/` 是内置插件包本身，所以外挂目录改成项目根下的 `widgets_ext/`，同样支持环境变量。
+
+### 11.2 写法
+
+外挂插件的写法和内置插件**完全一样**，唯一区别是导入必须用绝对路径：
+
+```python
+from msu2_core import Widget, register, BOTH, get_font
+from widgets._util import row_text
+```
+
+不能用相对导入（`from ._util import ...`），因为外挂模块不属于 `widgets` 包。
+
+一个文件一个模块，也可以放整个包：
+
+```
+widgets/
+├── hello_widget.py          单文件插件
+└── my_plugin/
+    ├── __init__.py          包插件（内部可以相对导入自己的子模块）
+    └── helper.py
+```
+
+以 `_` 或 `.` 开头的文件和目录会被跳过。
+
+### 11.3 依赖限制
+
+外挂插件跑在主程序进程里，**只能 import 已经打包进 exe 的库**：
+
+- 必有：标准库、`Pillow`、`pyserial`、`psutil`
+- 选有：`numpy`、`pynput`（取决于打包时有没有装）
+
+用了别的第三方库会 `ModuleNotFoundError`，插件加载失败但不影响其它插件。替代方案是自己用 `urllib.request` / `subprocess` / `ctypes` 实现。
+
+### 11.4 覆盖内置插件
+
+外挂插件和内置插件**同名**时，后加载的外挂版本会覆盖内置版本（日志会打 `插件 xxx 被重复注册，后者覆盖前者`）。可以用这个办法就地替换某个内置插件的行为，改坏了把文件删掉即可恢复。
+
+### 11.5 验证
+
+```bash
+MSU2_Console.exe --plugins
+```
+
+`SRC` 列会显示 `内置` / `外挂`。启动日志里也会打：
+
+```
+外部插件目录: C:\...\widgets
+外部插件加载 1 个: hello_widget.py (C:\...\widgets)
+```
+
+失败时日志会打 `加载外部插件 <路径> 失败: <原因>`，`--log DEBUG` 能看到完整堆栈。
+
+### 11.6 示例
+
+`example/widgets/hello_widget.py` 是一份可直接使用的外挂插件示例，涵盖了配置项（`config_schema`）、插件动作（`actions` + `on_action`）、触控手势（`on_action("touch_single", ...)`）、帧缓存（第二次返回 `None`）等常用写法。
 
 祝你好运

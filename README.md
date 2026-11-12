@@ -25,6 +25,7 @@
 - [硬件触控按键](#硬件触控按键)
 - [命令行参数](#命令行参数)
 - [打包成二进制文件](#打包成二进制文件)
+- [外挂插件](#外挂插件)
 - [插件开发](#插件开发)
 - [项目结构](#项目结构)
 - [常见问题](#常见问题)
@@ -34,28 +35,27 @@
 
 ## 内置插件
 
-18 个 demo
+17 个 demo
 
 | 插件 ID | 名称 | 功能 | 朝向 | 触控支持 |
 |---|---|---|---|---|
 | `clock` | 时钟 | 时间 + 年月日 + 星期 | 横 / 竖 | — |
 | `calendar` | 月历 | 月历 / 周历，今日高亮 | 横 / 竖 | — |
-| `countdown` | 倒计时 | 多事件倒计时，按紧迫度着色 | 横 / 竖 | — |
-| `anniversary` | 纪念日 | 如题 | 横 / 竖 | — |
-| `holiday` | 节假日 | 距下个节假日的天数 | 横 / 竖 | — |
+| `countdown` | 倒计时 | 多事件倒计时，按紧迫度着色 | 横 / 竖 | ✔ |
+| `anniversary` | 纪念日 | 任意多个纪念日，横屏一屏一个（名称在上、天数在下） | 横 / 竖 | ✔ |
+| `holiday` | 节假日 | 距下个节假日的天数 | 横 / 竖 | ✔ |
 | `pcstats` | 系统状态 | CPU / RAM / 磁盘 / 网络 / 开机时长 | 横 / 竖 | — |
 | `disk_io` | 磁盘读写 | 读写速率 + 折线图 | 横 / 竖 | — |
 | `network_detail` | 网络详情 | 网卡速率 + Wi-Fi 信号 | 横 / 竖 | — |
-| `process_top` | 进程排行 | Top 5 进程，可按 CPU / 内存排序 | 横 / 竖 | — |
-| `app_usage` | 前台应用 | 当前应用 + 使用时长 | 横 / 竖 | — |
-| `keyboard_stats` | 键盘统计 | 今日敲击次数 + KPM | 横 / 竖 | — |
-| `mouse_mileage` | 鼠标里程 | 今日移动距离 | 横 / 竖 | — |
-| `music` | 音乐 | 音乐信息 + 封面旋转动画 | 横 / 竖 | ✔ |
-| `crypto` | 加密货币 | 实时价 + 涨跌幅 | 横 / 竖 | — |
-| `clipboard` | 剪贴板 | 最近一条内容 | 横 / 竖 | ✔ |
-| `todo` | 待办 | 读 `todo.md`，Web 端可编辑 | 横 / 竖 | ✔ |
-| `wifi_scanner` | Wi-Fi 扫描 | 附近 SSID + 信号强度 | 横 / 竖 | ✔ |
-| `gif` | 背景透传 | 静态 / 动图背景 | 横 / 竖 | — |
+| `process_top` | 进程排行 | Top 6 进程，可按 CPU / 内存排序，名称过长自动滚动 | 横 / 竖 | — |
+| `app_usage` | 前台应用 | 当前应用 + 使用时长（启动即统计） | 横 / 竖 | ✔ |
+| `keyboard_stats` | 键盘统计 | 今日敲击次数 + KPM（可清零） | 横 / 竖 | ✔ |
+| `mouse_mileage` | 鼠标里程 | 今日移动距离（可清零） | 横 / 竖 | ✔ |
+| `music` | 音乐 | 音乐信息 + 旋转光盘 | 横 / 竖 | ✔ |
+| `crypto` | 加密货币 | 实时价 + 涨跌幅，可配刷新周期 | 横 / 竖 | ✔ |
+| `clipboard` | 剪贴板 | 剪贴板历史，可固定当前条 | 横 / 竖 | ✔ |
+| `todo` | 待办 | 读 `todo.md`，Web 端可编辑，支持勾选/翻页 | 横 / 竖 | ✔ |
+| `gif` | 背景透传 | 只显示背景图，不带任何设置与动作 | 横 / 竖 | — |
 
 「触控支持」一栏表示该插件实现了 `on_action("touch_*")`，在透传模式下响应小屏按键。
 
@@ -160,11 +160,13 @@ python msu2_mini.py
 |---|---|---|---|
 | music | 下一首 | 上一首 | 播放 / 暂停 |
 | todo | 选中下一条 | 选中上一条 | 勾选 / 取消 |
-| wifi_scanner | 立即刷新 | — | — |
 | clipboard | — | — | 固定 / 取消固定 |
+| countdown、holiday、crypto | 下一个 | 上一个 | — |
+
+每个插件的具体手势含义写在该插件的配置面板里（打开 `⋯` → `设置` 就能看到"透传触控"一行）。
    
    > 需要 `playerctl`（Linux）/ pynput（宏）等外部工具支持的，见[安装](#安装)。
-2. **全局模式**：任意一个手势选了具体动作，则所有手势走全局定义，插件不再收到触控。
+2. **全局模式**：某个手势选了具体动作，只有那个手势走全局定义；选了 未定义（透传给插件） 的手势仍然交给插件处理。
 
 **可选动作**：
 
@@ -185,24 +187,27 @@ python msu2_mini.py
 
 ### 页面顺序
 
-- 每一行是一个插件。`↑↓` 调整顺序，`×` 停用，`+` 启用
-- `⚙` 打开该插件的配置表单
+- 每一行是一个插件。`↑↓` 调整顺序，`×` 停用
 - 蓝色高亮 + ▶ 标记的是当前屏幕正在显示的插件
-- 插件右侧的按钮是插件自定义的动作（目前没有插件实现）
+- 每行右侧是 `⋯` 按钮（在 `[landscape/portrait]` 左边），点开是弹出菜单：`设置` 加该插件自定义的动作，没有配置也没有动作的插件不显示这个按钮
+- 弹出菜单不会自己关：再点一次 `⋯`、点另一个 `⋯`，或者点菜单里的项目才会关闭
+- **拖拽**任意页面行可以调整顺序
+- **双击**页面名称可以立即切换到该页
 
 ### 配置面板
 
-点任意插件的 `⚙` 会展开配置表单，修改后点"保存"立即生效，同时写入 `config.json`。
+点弹出菜单里的 `设置` 会展开配置表单，修改后点"保存"立即生效，同时写入 `config.json`。
 
 ### 背景图
 
-- 填图片路径（支持 PNG / JPG / GIF），点"启用背景"
-- 背景图会铺满整屏，插件绘制的透明区域会透出背景
-- 应该支持动态 GIF
+- 填图片路径（支持 PNG / JPG / GIF）或图片目录，选好缩放方式后点"启用背景"
+- 三种缩放方式：`适应` / `填充` / `拉伸`
+- 插件绘制的透明区域会透出背景
+- 支持动态 GIF 和图片序列目录（目录内按文件名顺序循环播放）
 
 ### 状态
 
-实时 JSON 显示：连接状态、串口号、当前插件、朝向、翻转、锁定、背景开关。
+实时 JSON 显示：连接状态、串口号、当前插件、朝向、翻转、锁定、背景开关与缩放方式。
 
 ---
 
@@ -267,7 +272,9 @@ python msu2_mini.py [选项]
 | `--plugins` | 列出所有已发现的插件 |
 | `--init-config` | 删除旧配置，重新生成 `config.json` |
 | `--headless` | 无头模式，不启动 WebUI |
-| `--log DEBUG` | 打印 DEBUG 级日志 |
+| `--log DEBUG` | 打印 DEBUG 级日志（也可用 `--log-level DEBUG`） |
+| `--log-level DEBUG` | 日志级别：`DEBUG` / `INFO` / `WARNING` / `ERROR` |
+| `--log-file run.log` | 日志同时写入文件 |
 | `--config 2333.json` | 指定配置文件路径 |
 | `--port /dev/ttyACM0` | 手动指定串口，跳过自动扫描 |
 
@@ -290,7 +297,7 @@ pip install pyinstaller
 **注意**：
 
 - 想看到控制台窗口输出日志，删掉 `build.bat` 里的 `--noconsole`
-- 想动态添加插件，删掉 `--onefile`，这样 exe 旁边会有一个 `_internal` 文件夹，可以往里丢新的 `.py` 文件。**不推荐，偏离打包的意义**
+- 单文件版**支持外挂插件**，不需要为了加插件去删 `--onefile`，见下面的「外挂插件」一节
 
 ### Linux
 
@@ -307,6 +314,109 @@ chmod +x build.sh
 ### macOS
 
 未测试。理论命令与 Linux 相同。
+
+### 统一打包脚本
+
+三个平台的构建参数写在 `tools/build_exe.py` 里，本地直接调：
+
+```bash
+python tools/build_exe.py --mode console            # 带控制台
+python tools/build_exe.py --mode noconsole          # 无控制台（Windows 才有区别）
+python tools/build_exe.py --name MyBuild --dist out # 自定义产物名与目录
+```
+
+脚本会自动带上 `msu2_core` / `widgets` / `assets` 三个数据目录、隐藏导入和图标，缺哪个可选依赖就自动排除哪一项（比如没装 numpy 就走纯 Python 编码器）。
+
+### GitHub Actions
+
+仓库自带 [`.github/workflows/build.yml`](.github/workflows/build.yml)，推 `v*` 标签或在 Actions 页面手动 `Run workflow` 就会构建 **8 个产物**：
+
+| 产物 | 说明 |
+|---|---|
+| `MSU2_Console-windows-x64-console` | Windows 64 位，带控制台 |
+| `MSU2_Console-windows-x64-noconsole` | Windows 64 位，无控制台 |
+| `MSU2_Console-windows-x86-console` | Windows 32 位，带控制台 |
+| `MSU2_Console-windows-x86-noconsole` | Windows 32 位，无控制台 |
+| `MSU2_Console-windows-arm64-console` | Windows ARM64，带控制台 |
+| `MSU2_Console-windows-arm64-noconsole` | Windows ARM64，无控制台 |
+| `MSU2_Console-linux-x64` | Linux x86_64 |
+| `MSU2_Console-linux-arm64` | Linux aarch64 |
+
+每个产物都是单文件，从对应平台的 job 里直接下载 Actions artifact 即可。Linux 只有一个版本，因为 PyInstaller 在 Linux 上会忽略 `--noconsole`，两种模式产出同一个二进制。
+
+Windows x86 用 32 位 Python 构建（`psutil` 钉在最后一版带 win32 轮子的 `7.1.1`），Windows ARM64 用 python.org 的 arm64 安装包，Linux 用各自的系统 Python 建 venv，不依赖预装版本。
+
+---
+
+## 外挂插件
+
+单文件 exe 也能加第三方插件，**不用重新打包**。
+
+在 exe 旁边建一个 `widgets` 文件夹，把 `.py` 丢进去即可：
+
+```
+MSU2_Console.exe
+widgets/
+├── hello_widget.py
+└── my_plugin.py
+```
+
+重启程序，插件就会被自动发现并出现在 Web 的页面列表里。
+
+### 搜索顺序
+
+按下面的顺序找插件目录，**全部都会加载**（不是只加载第一个）：
+
+1. 环境变量 `MSU2_WIDGETS_DIR` 指定的目录（多个用系统路径分隔符隔开，Windows 是 `;`）
+2. exe 同级的 `widgets/`
+3. `%LOCALAPPDATA%\MSU2_MINI\widgets\`（Linux/macOS 上是 `~/.local/share/MSU2_MINI/widgets/`）
+
+源码方式运行（`python msu2_mini.py`）时，外挂目录是项目根目录下的 `widgets_ext/`，因为 `widgets/` 本身已经是内置插件包了。
+
+### 目录里放什么
+
+- `something.py` —— 一个文件就是一个插件模块
+- `something/__init__.py` —— 也可以放整个包，包内可以多文件、相对导入
+- 以 `_` 或 `.` 开头的文件和文件夹会被跳过
+
+### 限制
+
+外挂插件运行在主程序进程里，所以：
+
+- **只能用程序已经打包进去的库**：标准库 + `Pillow` + `pyserial` + `psutil`，另加可选装好的 `numpy` / `pynput`
+- 想用别的第三方库（`requests`、`psutil` 之外的系统库等），必须自己改成 `urllib` / `subprocess` 等标准库实现，或者自己重新打包
+- 插件用绝对导入 `from msu2_core import ...`，**不要用相对导入**（`from .xxx`）
+- 单个插件导入失败只会打一条 ERROR 日志，不影响其它插件
+
+### 验证是否加载成功
+
+```bash
+MSU2_Console.exe --plugins
+```
+
+`SRC` 列会标出 `内置` / `外挂`：
+
+```
+NAME               ORI                    PRI   SRC    DESC
+--------------------------------------------------------------------------------------
+clock              landscape/portrait     10    内置
+hello_external     landscape/portrait     200   外挂
+```
+
+启动日志里也会打印：
+
+```
+外部插件目录: C:\...\widgets
+外部插件加载 1 个: hello_widget.py (C:\...\widgets)
+```
+
+### 示例
+
+`example/widgets/hello_widget.py` 是一个可以直接用的外挂插件示例，
+复制到 exe 旁边的 `widgets/` 里就能跑（含配置项、插件动作、触控手势）。
+
+> 外挂插件和内置插件**同名**时会被后者覆盖（日志里会警告「插件 xxx 被重复注册」），
+> 可以用这个办法替换某个内置插件的行为。
 
 ---
 
@@ -343,7 +453,7 @@ class HelloWidget(Widget):
 
 ### 声明式配置
 
-只要声明 `config_schema`，Web 上会自动出现 `⚙` 按钮和表单：
+只要声明 `config_schema`，Web 上该行会出现 `⋯` 按钮，菜单里的 `设置` 会展开表单：
 
 ```python
 from msu2_core import Field
@@ -414,7 +524,7 @@ class MyWidget(Widget):
 
 `return {"ok": True}` 会让主程序立刻触发重绘，不用等 `interval`。
 
-参考实现：`music` / `todo` / `wifi_scanner` / `clipboard`。
+参考实现：`music` / `todo` / `clipboard`。
 
 ### 渲染提示
 
@@ -460,13 +570,18 @@ MSU2_MINI_Console/
 ├── build.sh                  # Linux 打包脚本
 ├── README.md
 ├── widgets-dev.md            # 插件开发手册
+├── assets/
+│   └── fonts/                # 内置字体（Noto Sans Mono CJK SC）
+├── example/
+│   └── widgets/              # 外挂插件示例
 ├── msu2_core/ 
 │   ├── __init__.py           # 对外 API
 │   ├── widget.py             # Widget 基类 + 渲染上下文 + 字体
 │   ├── registry.py           # 插件注册表
 │   └── config_schema.py      # 配置字段类型
-└── widgets/                  # 插件目录
-    ├── __init__.py           # 自动发现
+└── widgets/                  # 内置插件目录
+    ├── __init__.py           # 自动发现（含外挂目录加载）
+    ├── _util.py              # 插件公用绘制工具
     ├── clock.py
     ├── pcstats.py
     ├── music.py
@@ -479,18 +594,18 @@ MSU2_MINI_Console/
 
 **Q: 屏幕上的中文字显示成问号 / 方块？**
 
-字体问题。Windows 上一定有 `msyh.ttc`（微软雅黑），Linux 可能没有：
+正常情况不会出现：字体已内置在 `assets/fonts/`（Noto Sans Mono CJK SC，
+SIL OFL 1.1），不需要系统装任何字体。
 
-```bash
-# Ubuntu / Debian
-sudo apt install fonts-noto-cjk
-```
-
-或者在 `config.json` 里显式指定字体路径：
+如果确实出现了，说明 `assets/fonts/` 缺失（比如自己打包时没带 `--add-data`），
+把 `assets/fonts/NotoSansMonoCJKsc-*.otf` 放回 exe 同目录即可。
+也可以在 `config.json` 里用 `"font"` 指定自己的字体文件覆盖内置字体：
 
 ```json
 "font": "C:/Windows/Fonts/msyh.ttc"
 ```
+
+内置字体覆盖 GB2312 全部汉字与常用符号，极少见的生僻字会显示成方块。
 
 ---
 
@@ -531,12 +646,6 @@ Linux Wayland 会话下 `pynput` 不工作，换 X11 会话。
 
 ---
 
-**Q: 音乐封面显示不出来？**
-
-我没做好
-
----
-
 **Q: CPU / 内存 / 磁盘读数不对？**
 
 `psutil.cpu_percent()` 第一次调用返回 0，是正常的。启动 1 秒后才会显示真实值。
@@ -573,6 +682,18 @@ sudo usermod -a -G dialout $USER
 ```
 
 注销重新登录后生效。
+
+---
+
+**Q: 放到 `widgets/` 的外挂插件没被加载？**
+
+按顺序排查：
+
+1. `MSU2_Console.exe --plugins` 看 `SRC` 列有没有 `外挂`
+2. 看启动日志里的 `外部插件目录: ...`，确认路径对不对（是 **exe 所在目录** 下的 `widgets`，不是当前工作目录）
+3. 文件名不能以 `_` 开头，扩展名必须是 `.py`
+4. 看日志里有没有 `加载外部插件 ... 失败`，后面跟的就是真实原因（最常见是 `ModuleNotFoundError`，用了没打包进去的第三方库）
+5. 用 `--log DEBUG` 再跑一次，会有更详细的堆栈
 
 ---
 
