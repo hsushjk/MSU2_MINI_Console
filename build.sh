@@ -7,6 +7,11 @@ export PYTHONPATH="$PWD:$PYTHONPATH"
 rm -rf build/ dist/ __pycache__/
 rm -f *.spec
 
+EXTRA=""
+if [ -f icon.ico ]; then EXTRA="--icon=icon.ico"; fi
+
+if [ -d assets ]; then EXTRA="$EXTRA --add-data assets:assets"; fi
+
 pyinstaller \
   --onefile \
   --clean \

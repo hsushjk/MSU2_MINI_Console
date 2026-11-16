@@ -16,6 +16,8 @@ dist/
 # msu2数据
 config.json
 config.*.json
+config.json.bad
+config.json.tmp
 todo.md
 screenshots/
 assets/gif/*.jpg

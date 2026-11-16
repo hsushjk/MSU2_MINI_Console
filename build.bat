@@ -7,6 +7,7 @@ del /q *.spec 2>nul
 
 set EXTRA=
 if exist icon.ico set EXTRA=!EXTRA! --icon=icon.ico
+if exist assets set EXTRA=!EXTRA! --add-data "assets;assets"
 
 pyinstaller ^
   --onefile ^
