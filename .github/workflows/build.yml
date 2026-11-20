@@ -1,0 +1,175 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: windows-${{ matrix.arch }}-${{ matrix.mode }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+        mode: [console, noconsole]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          architecture: ${{ matrix.arch }}
+
+      - name: install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pyserial>=3.5" "pillow>=10" "pyinstaller>=6.10"
+          if ("${{ matrix.arch }}" -eq "x86") {
+            python -m pip install "psutil==7.1.1"
+          } else {
+            python -m pip install "psutil>=5.9"
+          }
+          python -m pip install "numpy>=1.26" "pynput>=1.7.6"
+          python -c "import serial, PIL, psutil; print('deps ok')"
+
+      - name: build
+        shell: pwsh
+        run: |
+          $name = "MSU2_Console-windows-${{ matrix.arch }}-${{ matrix.mode }}"
+          python tools/build_exe.py --mode ${{ matrix.mode }} --name $name --dist dist --work build
+
+      - name: smoke test
+        if: matrix.mode == 'console'
+        shell: pwsh
+        run: |
+          $exe = "dist\MSU2_Console-windows-${{ matrix.arch }}-${{ matrix.mode }}.exe"
+          $out = (& $exe --plugins 2>&1 | Out-String)
+          if ($out -notmatch "clock") { throw "插件列表输出异常" }
+          Write-Host $out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MSU2_Console-windows-${{ matrix.arch }}-${{ matrix.mode }}
+          path: dist/MSU2_Console-windows-${{ matrix.arch }}-${{ matrix.mode }}.exe
+          if-no-files-found: error
+
+  windows-arm64:
+    name: windows-arm64-${{ matrix.mode }}
+    runs-on: windows-11-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [console, noconsole]
+    env:
+      PY_ARM64_VERSION: "3.13.11"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: prepare python
+        shell: pwsh
+        run: |
+          $py = ""
+          $cmd = Get-Command python -ErrorAction SilentlyContinue
+          if ($cmd) {
+            $arch = (& $cmd.Source -c "import platform; print(platform.machine())" 2>$null)
+            if ($arch -match "ARM64") { $py = $cmd.Source }
+          }
+          if (-not $py) {
+            $url = "https://www.python.org/ftp/python/$env:PY_ARM64_VERSION/python-$env:PY_ARM64_VERSION-arm64.exe"
+            $file = Join-Path $env:RUNNER_TEMP "python-arm64.exe"
+            Invoke-WebRequest -Uri $url -OutFile $file
+            $installArgs = @("/quiet", "InstallAllUsers=0", "PrependPath=0", "Include_pip=1", "Include_test=0")
+            Start-Process -FilePath $file -ArgumentList $installArgs -Wait
+            $roots = @(
+              (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313-arm64"),
+              (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313"),
+              (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312-arm64")
+            )
+            foreach ($r in $roots) {
+              if (Test-Path (Join-Path $r "python.exe")) { $py = Join-Path $r "python.exe"; break }
+            }
+            if (-not $py) {
+              $hit = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA "Programs\Python") -Filter python.exe -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+              if ($hit) { $py = $hit.FullName }
+            }
+          }
+          if (-not $py) { throw "没有可用的 ARM64 Python" }
+          & $py -c "import platform; print('python', platform.machine(), platform.python_version())"
+          "PY_ARM64=$py" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: install dependencies
+        shell: pwsh
+        run: |
+          & $env:PY_ARM64 -m pip install --upgrade pip
+          & $env:PY_ARM64 -m pip install "pyserial>=3.5" "pillow>=10" "psutil>=5.9" "pyinstaller>=6.10"
+          & $env:PY_ARM64 -m pip install "numpy>=1.26" "pynput>=1.7.6"
+          & $env:PY_ARM64 -c "import serial, PIL, psutil; print('deps ok')"
+
+      - name: build
+        shell: pwsh
+        run: |
+          $name = "MSU2_Console-windows-arm64-${{ matrix.mode }}"
+          & $env:PY_ARM64 tools\build_exe.py --mode ${{ matrix.mode }} --name $name --dist dist --work build
+
+      - name: smoke test
+        if: matrix.mode == 'console'
+        shell: pwsh
+        run: |
+          $exe = "dist\MSU2_Console-windows-arm64-${{ matrix.mode }}.exe"
+          $out = (& $exe --plugins 2>&1 | Out-String)
+          if ($out -notmatch "clock") { throw "插件列表输出异常" }
+          Write-Host $out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MSU2_Console-windows-arm64-${{ matrix.mode }}
+          path: dist/MSU2_Console-windows-arm64-${{ matrix.mode }}.exe
+          if-no-files-found: error
+
+  linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: prepare python
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install "pyserial>=3.5" "pillow>=10" "psutil>=5.9" "pyinstaller>=6.10"
+          python -m pip install "numpy>=1.26" || echo "numpy 不可用，构建无 numpy 版本"
+          python -c "import serial, PIL, psutil; print('deps ok')"
+
+      - name: build
+        run: |
+          . .venv/bin/activate
+          python tools/build_exe.py --mode console --name MSU2_Console-linux-${{ matrix.arch }} --dist dist --work build
+
+      - name: smoke test
+        run: |
+          chmod +x dist/MSU2_Console-linux-${{ matrix.arch }}
+          out=$(dist/MSU2_Console-linux-${{ matrix.arch }} --plugins 2>&1)
+          echo "$out" | tail -n 20
+          echo "$out" | grep -q clock
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MSU2_Console-linux-${{ matrix.arch }}
+          path: dist/MSU2_Console-linux-${{ matrix.arch }}
+          if-no-files-found: error
