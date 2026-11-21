@@ -112,76 +112,6 @@ def _read_clipboard():
         return None
 
 
-def _write_clipboard(text):
-    text = str(text or "")
-    try:
-        if sys.platform == "win32":
-            return _set_windows(text)
-        if sys.platform == "darwin":
-            return _set_mac(text)
-        return _set_linux(text)
-    except Exception:
-        return False
-
-
-def _set_windows(text):
-    import ctypes
-    from ctypes import wintypes
-
-    CF_UNICODETEXT = 13
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    if not user32.OpenClipboard(None):
-        return False
-    try:
-        user32.EmptyClipboard()
-        data = text.encode("utf-16-le") + b"\x00\x00"
-        size = len(data)
-        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
-        handle = kernel32.GlobalAlloc(0x0042, size)
-        if not handle:
-            return False
-        kernel32.GlobalLock.restype = ctypes.c_void_p
-        ptr = kernel32.GlobalLock(wintypes.HGLOBAL(handle))
-        if not ptr:
-            return False
-        try:
-            ctypes.memmove(ptr, data, size)
-        finally:
-            kernel32.GlobalUnlock(wintypes.HGLOBAL(handle))
-        user32.SetClipboardData(CF_UNICODETEXT, wintypes.HANDLE(handle))
-        return True
-    finally:
-        user32.CloseClipboard()
-
-
-def _set_mac(text):
-    p = subprocess.run(["pbcopy"], input=text.encode("utf-8"),
-                       timeout=3, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
-    return p.returncode == 0
-
-
-def _set_linux(text):
-    tools = [
-        ("wl-copy", ["wl-copy"]),
-        ("xclip", ["xclip", "-selection", "clipboard"]),
-        ("xsel", ["xsel", "--clipboard", "--input"]),
-    ]
-    for name, cmd in tools:
-        if not shutil.which(name):
-            continue
-        try:
-            p = subprocess.run(cmd, input=text.encode("utf-8"), timeout=3,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
-            if p.returncode == 0:
-                return True
-        except Exception:
-            continue
-    return False
-
-
 def _linux_hint():
     if not sys.platform.startswith("linux"):
         return None
@@ -202,7 +132,6 @@ class ClipboardWidget(Widget):
         "next": "下一个",
         "prev": "上一个",
         "pin": "固定/取消固定",
-        "copy": "回写到剪贴板",
     }
     touch_help = "单击=下一个，双击=上一个，长按=固定/取消固定"
 
@@ -305,25 +234,6 @@ class ClipboardWidget(Widget):
                     return {"ok": False, "err": "没有可固定的内容"}
                 st["_last_key"] = None
                 return {"ok": True}
-            if action in ("copy", "write", "to_clipboard"):
-                with st["lock"]:
-                    if st.get("pinned") and st.get("pin_text"):
-                        text = st["pin_text"]
-                    else:
-                        history = list(st.get("history") or [])
-                        index = int(st.get("index", 0) or 0)
-                        if history:
-                            if index < 0 or index >= len(history):
-                                index = 0
-                            text = history[index]
-                        else:
-                            text = st.get("text", "")
-                if not text:
-                    return {"ok": False, "err": "没有可写入的内容"}
-                if not _write_clipboard(text):
-                    return {"ok": False, "err": "写入剪贴板失败"}
-                st["_last_key"] = None
-                return {"ok": True, "msg": "已写回剪贴板"}
             if action in ("next", "touch_single"):
                 if not self._do_step(st, 1):
                     return {"ok": False, "err": "没有历史内容"}
