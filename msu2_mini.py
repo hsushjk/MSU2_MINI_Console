@@ -1957,12 +1957,6 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 
 <div class="card">
   <h2>背景图</h2>
-  <div>
-    <input type="text" id="bg-path" placeholder="path/to/image.gif|png|jpg" style="width:22em">
-  </div>
-  <div style="margin-top:4px">
-    <textarea id="bg-paths" rows="3" style="width:100%"
-      placeholder="多张背景：一行一个路径"></textarea>
   <div style="margin-top:4px">
     <label style="font-size:12px;color:#666">模式
       <select id="bg-source" onchange="setBgSource()">
@@ -1977,6 +1971,12 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
       <input type="checkbox" id="bg-shuffle"> 无序轮播
     </label>
   </div>
+  <div style="margin-top:4px" id="bg-single-wrap">
+    <input type="text" id="bg-path" placeholder="path/to/image.gif|png|jpg" style="width:22em">
+  </div>
+  <div style="margin-top:4px" id="bg-multi-wrap">
+    <textarea id="bg-paths" rows="3" style="width:100%"
+      placeholder="多张背景：一行一个路径"></textarea>
   </div>
   <div style="margin-top:4px">
     <label style="font-size:12px;color:#666">显示方式
@@ -2206,12 +2206,12 @@ function setBgSource() {
   const pl = bgSource() === 'playlist';
   const pw = document.getElementById('bg-iv-wrap');
   const sw = document.getElementById('bg-sh-wrap');
-  const single = document.getElementById('bg-path');
-  const multi = document.getElementById('bg-paths');
+  const single = document.getElementById('bg-single-wrap');
+  const multi = document.getElementById('bg-multi-wrap');
   if (pw) pw.style.display = pl ? '' : 'none';
   if (sw) sw.style.display = pl ? '' : 'none';
-  if (single) single.parentElement.style.display = pl ? 'none' : '';
-  if (multi) multi.parentElement.style.display = pl ? '' : 'none';
+  if (single) single.style.display = pl ? 'none' : '';
+  if (multi) multi.style.display = pl ? '' : 'none';
 }
 
 function bgInterval() {
@@ -2286,6 +2286,10 @@ async function refresh() {
     if (srcEl && document.activeElement !== srcEl) {
       srcEl.value = j.background_source || 'single';
       setBgSource();
+    }
+    const pthEl = document.getElementById('bg-paths');
+    if (pthEl && document.activeElement !== pthEl) {
+      pthEl.value = (j.background_paths || []).join('\n');
     }
     const ivEl = document.getElementById('bg-interval');
     if (ivEl && document.activeElement !== ivEl) {
