@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import collections
 import datetime
+import io
 import json
 import logging
 import os
@@ -36,7 +37,7 @@ except ImportError:
     _console("缺少 pyserial: pip install pyserial"); sys.exit(1)
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except ImportError:
     _console("缺少 Pillow: pip install pillow"); sys.exit(1)
 
@@ -54,7 +55,7 @@ try:
     from msu2_core import (
         WIDGET_REGISTRY, RenderContext, Widget,
         LANDSCAPE, PORTRAIT, LANDSCAPE_SIZE, PORTRAIT_SIZE,
-        probe_fonts, set_user_font,
+        probe_fonts, set_user_font, get_font,
         merge_config,
     )
     import widgets as _widgets_pkg
@@ -148,6 +149,7 @@ class SerialTransport:
         self._connected = False
         self._handshaked = False
         self.last_error = None
+        self.bytes_written = 0
 
     def open(self):
         with self._lock:
@@ -194,7 +196,9 @@ class SerialTransport:
             if not self._connected or not self._ser:
                 return False
             try:
-                self._ser.write(data); return True
+                self._ser.write(data)
+                self.bytes_written += len(data)
+                return True
             except Exception as e:
                 log.warning("写入失败: %s", e)
                 self._connected = False; self._handshaked = False
@@ -376,60 +380,124 @@ class MiniDevice:
 class Background:
     MAX_FRAMES = 300
     MODES = ("fit", "fill", "stretch")
+    PLAYLIST_SECS = 12.0
 
     def __init__(self):
         self.path = ""
         self.mode = "fit"
+        self.dim = 0
+        self.blur = 0
+        self.raw = []
+        self.frames = []
+        self.durations = []
+        self.groups = []
+        self.group_idx = 0
+        self.group_ts = None
+        self.idx = 0
+        self.t_last = None
+
+    def configure(self, dim=0, blur=0):
+        self.dim = _coerce_int(dim, 0, 0, 90)
+        self.blur = _coerce_int(blur, 0, 0, 12)
+        self.frames = [self._decorate(f) for f in self.raw]
+
+    def _decorate(self, img):
+        if not self.raw:
+            return img
+        out = img
+        if self.blur > 0:
+            try:
+                from PIL import ImageFilter
+                out = out.filter(ImageFilter.GaussianBlur(self.blur))
+            except Exception:
+                pass
+        if self.dim > 0:
+            try:
+                overlay = Image.new("RGB", out.size, "black")
+                out = Image.blend(out, overlay, self.dim / 100.0)
+            except Exception:
+                pass
+        return out
+
+    def load_playlist(self, paths, mode=None):
+        if mode is not None:
+            self.mode = mode if mode in self.MODES else "fit"
+        self.path = ";".join(paths)
+        self.groups = []
+        self.raw = []
         self.frames = []
         self.durations = []
         self.idx = 0
         self.t_last = None
+        self.group_idx = 0
+        self.group_ts = None
+        for i, path in enumerate(paths[:32]):
+            if not path:
+                continue
+            self.raw = []
+            self.durations = []
+            self._read_path(Path(path))
+            if self.raw:
+                self.groups.append((list(self.raw), list(self.durations)))
+        self.raw = []
+        self.durations = []
+        if self.groups:
+            self.raw, self.durations = list(self.groups[0][0]), list(self.groups[0][1])
+            self.frames = [self._decorate(f) for f in self.raw]
+        log.info("背景轮播已加载: %d 组 (%s, 模式 %s)", len(self.groups),
+                 self.path, self.mode)
 
-    def load(self, path, mode=None):
-        self.path = path
-        if mode is not None:
-            self.mode = mode if mode in self.MODES else "fit"
-        self.frames = []; self.durations = []
-        self.idx = 0; self.t_last = None
-        if not path:
-            return
-        p = Path(path)
+    def _read_path(self, p):
         if not p.exists():
-            log.warning("背景图不存在: %s", p); return
+            log.warning("背景图不存在: %s", p)
+            return
         if p.is_dir():
-            self._load_dir(p)
+            try:
+                files = sorted(x for x in p.iterdir()
+                               if x.is_file() and x.suffix.lower() in IMAGE_EXTS)
+            except Exception as e:
+                log.warning("扫描图片目录失败: %s", e)
+                return
+            for f in files[:self.MAX_FRAMES]:
+                try:
+                    with Image.open(f) as src:
+                        self.raw.append(self._frame(src.convert("RGB")))
+                    self.durations.append(0.2)
+                except Exception as e:
+                    log.warning("跳过图片 %s: %s", f.name, e)
             return
         try:
             with Image.open(p) as src:
                 if getattr(src, "is_animated", False):
                     for i in range(min(src.n_frames, self.MAX_FRAMES)):
                         src.seek(i)
-                        self.frames.append(self._frame(src.convert("RGB")))
+                        self.raw.append(self._frame(src.convert("RGB")))
                         self.durations.append(
                             max(0.05, src.info.get("duration", 100) / 1000.0))
                 else:
-                    self.frames = [self._frame(src.convert("RGB"))]
-                    self.durations = [0.0]
+                    self.raw.append(self._frame(src.convert("RGB")))
+                    self.durations.append(0.0)
         except Exception as e:
             log.warning("背景图处理失败: %s", e)
-            self.frames = []; self.durations = []
-        log.info("背景图已加载: %s (%d 帧, 模式 %s)", path, len(self.frames), self.mode)
+            self.raw = []
+            self.durations = []
 
-    def _load_dir(self, p):
-        try:
-            files = sorted(x for x in p.iterdir()
-                           if x.is_file() and x.suffix.lower() in IMAGE_EXTS)
-        except Exception as e:
-            log.warning("扫描图片目录失败: %s", e); return
-        for f in files[:self.MAX_FRAMES]:
-            try:
-                with Image.open(f) as src:
-                    self.frames.append(self._frame(src.convert("RGB")))
-                self.durations.append(0.2)
-            except Exception as e:
-                log.warning("跳过图片 %s: %s", f.name, e)
-        log.info("背景图序列已加载: %s (%d 张, 模式 %s)", p, len(self.frames),
-                 self.mode)
+    def load(self, path, mode=None):
+        self.path = path
+        if mode is not None:
+            self.mode = mode if mode in self.MODES else "fit"
+        self.groups = []
+        self.raw = []
+        self.frames = []
+        self.durations = []
+        self.idx = 0
+        self.t_last = None
+        self.group_ts = None
+        if not path:
+            return
+        self._read_path(Path(path))
+        self.frames = [self._decorate(f) for f in self.raw]
+        log.info("背景图已加载: %s (%d 帧, 模式 %s)", path, len(self.frames), self.mode)
 
     def _frame(self, img):
         tw, th = SCREEN_W, SCREEN_H
@@ -454,6 +522,17 @@ class Background:
             return Image.new("RGB", (tw, th), "black")
 
     def tick(self, now):
+        if len(self.groups) > 1:
+            if self.group_ts is None:
+                self.group_ts = now
+            elif now - self.group_ts >= self.PLAYLIST_SECS:
+                self.group_ts = now
+                self.group_idx = (self.group_idx + 1) % len(self.groups)
+                self.raw, self.durations = list(self.groups[self.group_idx][0]), list(self.groups[self.group_idx][1])
+                self.frames = [self._decorate(f) for f in self.raw]
+                self.idx = 0
+                self.t_last = None
+                log.debug("背景切换到第 %d 组", self.group_idx + 1)
         if not self.frames:
             return None
         if len(self.frames) == 1:
@@ -622,11 +701,58 @@ def _coerce_int(value, default, lo=None, hi=None):
         v = hi
     return v
 
+def _widget_watch_dirs():
+    dirs = []
+    try:
+        base = getattr(_widgets_pkg, "_pkg_path", None)
+        if base is not None:
+            dirs.append(Path(base))
+        for item in list(getattr(_widgets_pkg, "_ext_dirs", []) or []):
+            dirs.append(Path(item))
+    except Exception:
+        pass
+    return dirs
+
+def _build_overlay(text, orientation):
+    w, h = (PORTRAIT_SIZE if orientation == PORTRAIT else LANDSCAPE_SIZE)
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    pad = 6
+    font = get_font(12, bold=True, cjk=True)
+    max_w = w - pad * 2 - 12
+    lines = []
+    cur = ""
+    for ch in text:
+        if ch == "\n":
+            lines.append(cur)
+            cur = ""
+            continue
+        if cur and d.textlength(cur + ch, font=font) > max_w:
+            lines.append(cur)
+            cur = ch
+        else:
+            cur += ch
+    if cur:
+        lines.append(cur)
+    lines = lines[:6]
+    line_h = 16
+    box_h = len(lines) * line_h + 12
+    box_y = max(3, (h - box_h) // 2)
+    d.rounded_rectangle([pad, box_y, w - pad, box_y + box_h], radius=6,
+                        fill=(18, 22, 30, 235), outline=(90, 120, 200, 255))
+    y = box_y + 6
+    for line in lines:
+        d.text((pad + 6, y), line, font=font, fill=(240, 244, 255, 255))
+        y += line_h
+    return img
+
 class Scheduler(threading.Thread):
-    def __init__(self, device, config, on_config_changed=None, on_shutdown=None):
+    def __init__(self, device, config, on_config_changed=None, on_shutdown=None,
+                 shared=None):
         super().__init__(daemon=True, name="Scheduler")
         self.device = device
         self.config = config
+        self.shared = shared if isinstance(shared, dict) else {}
         self._on_config_changed = on_config_changed
         self._on_shutdown = on_shutdown
 
@@ -639,12 +765,29 @@ class Scheduler(threading.Thread):
             bg = {}
         self._bg_enabled = bool(bg.get("enabled", False))
         self._bg_path = str(bg.get("path", "") or "")
+        self._bg_paths = [p for p in (bg.get("paths") or []) if isinstance(p, str)]
         self._bg_mode = bg.get("mode")
         if self._bg_mode not in Background.MODES:
             self._bg_mode = "fit"
+        self._bg_dim = _coerce_int(bg.get("dim"), 0, 0, 90)
+        self._bg_blur = _coerce_int(bg.get("blur"), 0, 0, 12)
         self.background = Background()
-        if self._bg_enabled and self._bg_path:
-            self.background.load(self._bg_path, self._bg_mode)
+        self.background.configure(self._bg_dim, self._bg_blur)
+        if self._bg_enabled:
+            if self._bg_paths:
+                self.background.load_playlist(self._bg_paths, self._bg_mode)
+            elif self._bg_path:
+                self.background.load(self._bg_path, self._bg_mode)
+
+        self._overlay = None
+        self._overlay_until = 0.0
+        self._overlay_seen = None
+        self._frames_window = collections.deque()
+        self.metrics = {"frames": 0, "bytes": 0, "reconnects": 0,
+                        "render_ms": {}, "touch": 0}
+        self._schedule_seen = set()
+        self._watch_mtime = 0.0
+        self._watch_ts = 0.0
 
         self._touch_baseline = None
         self._touch_cal = []
@@ -659,7 +802,7 @@ class Scheduler(threading.Thread):
 
         self.ctx = RenderContext(
             device=device, now=time.time(),
-            orientation=self.orientation, config=config,
+            orientation=self.orientation, config=self._cfg_view(),
         )
         self._ctxs = {}
         self._last_entered = None
@@ -740,12 +883,21 @@ class Scheduler(threading.Thread):
         self._cooldown_until = now + MANUAL_COOLDOWN
         return True
 
+    def _cfg_view(self):
+        view = dict(self.shared) if self.shared else {}
+        view.update(self.config)
+        if self.shared:
+            view["widget_config"] = self.shared.get("widget_config") or {}
+            view["gif_dir"] = self.shared.get("gif_dir") or ""
+            view["font"] = self.shared.get("font") or ""
+        return view
+
     def _ctx_for(self, w):
         ctx = self._ctxs.get(w.name)
         if ctx is None:
             ctx = RenderContext(device=self.device, now=time.time(),
                                 orientation=self.orientation,
-                                state={}, config=self.config)
+                                state={}, config=self._cfg_view())
             self._ctxs[w.name] = ctx
         return ctx
 
@@ -928,22 +1080,146 @@ class Scheduler(threading.Thread):
         log.info("页面已更新: %s", pages)
         return pages
 
-    def set_background(self, enabled, path="", mode=None):
+    def set_background(self, enabled, path="", mode=None, paths=None, dim=None,
+                       blur=None):
         self._bg_enabled = bool(enabled)
         self._bg_path = str(path or "")
+        if paths is not None:
+            self._bg_paths = [p for p in paths if isinstance(p, str)][:32]
         if mode is not None:
             self._bg_mode = mode if mode in Background.MODES else "fit"
+        if dim is not None:
+            self._bg_dim = _coerce_int(dim, self._bg_dim, 0, 90)
+        if blur is not None:
+            self._bg_blur = _coerce_int(blur, self._bg_blur, 0, 12)
         self.post_op("background")
         return True
 
     def _apply_background(self):
-        if self._bg_enabled and self._bg_path:
+        self.background.configure(self._bg_dim, self._bg_blur)
+        if self._bg_enabled and self._bg_paths:
+            self.background.load_playlist(self._bg_paths, self._bg_mode)
+        elif self._bg_enabled and self._bg_path:
             self.background.load(self._bg_path, self._bg_mode)
         else:
             self.background.load("", self._bg_mode)
         self._switch.set()
-        log.info("背景 -> enabled=%s mode=%s path=%s",
-                 self._bg_enabled, self._bg_mode, self._bg_path)
+        log.info("背景 -> enabled=%s mode=%s dim=%d blur=%d path=%s",
+                 self._bg_enabled, self._bg_mode, self._bg_dim, self._bg_blur,
+                 self._bg_path)
+
+    def notify(self, text, secs=5):
+        text = str(text or "").strip()
+        if not text:
+            return False
+        try:
+            secs = _coerce_int(secs, 5, 1, 60)
+            img = _build_overlay(text, self.orientation)
+        except Exception as e:
+            log.warning("通知生成失败: %s", e)
+            return False
+        self._overlay = img
+        self._overlay_until = time.monotonic() + secs
+        self._overlay_seen = None
+        self._force_send = True
+        log.info("通知: %s (%ds)", text, secs)
+        return True
+
+    def _count_frame(self, mono):
+        self.metrics["frames"] = int(self.metrics.get("frames", 0)) + 1
+        total = 0
+        try:
+            total = int(getattr(self.device.transport, "bytes_written", 0))
+        except Exception:
+            total = 0
+        last = int(self.metrics.get("_bytes_last", 0))
+        delta = total - last if total >= last else 0
+        self.metrics["_bytes_last"] = total
+        self.metrics["bytes"] = int(self.metrics.get("bytes", 0)) + delta
+        self._frames_window.append((mono, delta))
+
+    def _check_schedules(self, now):
+        items = self.shared.get("schedules") if self.shared else None
+        if not items:
+            return
+        t = time.localtime(now)
+        hhmm = "%02d:%02d" % (t.tm_hour, t.tm_min)
+        day_key = time.strftime("%Y%m%d", t)
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("at") or "") != hhmm:
+                continue
+            days = item.get("days")
+            if days and t.tm_wday not in days:
+                continue
+            key = (day_key, i)
+            if key in self._schedule_seen:
+                continue
+            self._schedule_seen.add(key)
+            action = str(item.get("action") or "")
+            log.info("定时任务触发: %s -> %s", hhmm, action)
+            try:
+                self._exec_action(action)
+            except Exception as e:
+                log.warning("定时任务执行失败: %s", e)
+
+    def _watch_widgets(self, mono):
+        if mono - self._watch_ts < 1.5:
+            return
+        self._watch_ts = mono
+        stamp = 0.0
+        for d in _widget_watch_dirs():
+            try:
+                entries = list(d.iterdir())
+            except Exception:
+                continue
+            for f in entries:
+                try:
+                    if f.is_dir():
+                        target = f / "__init__.py"
+                        if not target.exists():
+                            continue
+                    elif f.suffix == ".py":
+                        target = f
+                    else:
+                        continue
+                    m = target.stat().st_mtime
+                except Exception:
+                    continue
+                if m > stamp:
+                    stamp = m
+        if self._watch_mtime == 0.0:
+            self._watch_mtime = stamp
+            return
+        if stamp > self._watch_mtime:
+            self._watch_mtime = stamp
+            log.info("检测到插件文件变化，正在重新加载")
+            self.post_op("reload")
+
+    def metrics_snapshot(self):
+        now = time.monotonic()
+        while self._frames_window and now - self._frames_window[0][0] > 10.0:
+            self._frames_window.popleft()
+        span = 0.0
+        if self._frames_window:
+            span = max(0.001, now - self._frames_window[0][0])
+        fps = len(self._frames_window) / span if span > 0.001 else 0.0
+        bps = sum(b for _, b in self._frames_window) / span if span > 0.001 else 0.0
+        render = dict(self.metrics.get("render_ms") or {})
+        top = sorted(render.items(), key=lambda kv: kv[1], reverse=True)[:6]
+        return {
+            "fps": round(fps, 2),
+            "bytes_per_sec": int(bps),
+            "frames": int(self.metrics.get("frames", 0)),
+            "bytes": int(self.metrics.get("bytes", 0)),
+            "reconnects": int(self.metrics.get("reconnects", 0)),
+            "touch": int(self.metrics.get("touch", 0)),
+            "render_ms": {k: round(v, 2) for k, v in top},
+            "background": {"enabled": self._bg_enabled, "mode": self._bg_mode,
+                           "dim": self._bg_dim, "blur": self._bg_blur,
+                           "frames": len(self.background.frames)},
+        }
 
     def switch_to(self, name):
         for i, w in enumerate(self._widgets):
@@ -1074,6 +1350,13 @@ class Scheduler(threading.Thread):
             log.info("触摸触发关闭程序")
             if callable(self._on_shutdown):
                 self._on_shutdown()
+        elif action == "blank":
+            size = PORTRAIT_SIZE if self.orientation == PORTRAIT else LANDSCAPE_SIZE
+            self._overlay = Image.new("RGBA", size, (0, 0, 0, 255))
+            self._overlay_until = time.monotonic() + 5.0
+            self._overlay_seen = None
+            self._force_send = True
+            log.info("屏幕已清空 5 秒")
         else:
             log.warning("未知触摸动作: %s", action)
 
@@ -1126,10 +1409,13 @@ class Scheduler(threading.Thread):
                     if not self.device.open():
                         time.sleep(1.0); continue
                     self.device.set_reverse(self.reverse)
+                    self.metrics["reconnects"] = int(self.metrics.get("reconnects", 0)) + 1
                     last_mono = 0.0
                     last_bg_ts = 0.0
 
                 self._drain_ops()
+                self._watch_widgets(time.monotonic())
+                self._check_schedules(time.time())
 
                 widgets = self._widgets
                 current = self._current
@@ -1158,7 +1444,26 @@ class Scheduler(threading.Thread):
                 need_heartbeat = (not need_render and not need_bg and
                                   mono - self._last_send_mono >= HEARTBEAT_INTERVAL)
 
-                if need_render:
+                if self._overlay is not None:
+                    if mono >= self._overlay_until:
+                        self._overlay = None
+                        self._overlay_seen = None
+                        self._force_send = True
+                        overlay = None
+                    else:
+                        overlay = self._overlay
+                else:
+                    overlay = None
+
+                if overlay is not None:
+                    key = id(overlay)
+                    if key != self._overlay_seen or self._force_send:
+                        self._overlay_seen = key
+                        if self.device.show_image(self._composite(overlay, mono)):
+                            self._last_send_mono = mono
+                            self._count_frame(mono)
+                        self._force_send = False
+                elif need_render:
                     last_mono = mono
                     t0 = time.perf_counter()
                     try:
@@ -1168,6 +1473,9 @@ class Scheduler(threading.Thread):
                         img = None
                         time.sleep(0.3)
                     t1 = time.perf_counter()
+                    cost = (t1 - t0) * 1000.0
+                    old = self.metrics["render_ms"].get(w.name, cost)
+                    self.metrics["render_ms"][w.name] = old * 0.8 + cost * 0.2
                     if img is not None:
                         self._last_imgs[w.name] = img
                     if need_bg:
@@ -1177,15 +1485,16 @@ class Scheduler(threading.Thread):
                         if frame is not None or need_bg:
                             if self.device.show_image(self._composite(frame, mono)):
                                 self._last_send_mono = mono
+                                self._count_frame(mono)
                             self._force_send = False
                     log.debug("渲染 %s: render=%.1fms total=%.1fms",
-                              w.name, (t1 - t0) * 1000.0,
-                              (time.perf_counter() - t0) * 1000.0)
+                              w.name, cost, (time.perf_counter() - t0) * 1000.0)
                 elif need_bg:
                     last_bg_ts = mono
                     if self.device.show_image(
                             self._composite(self._last_imgs.get(w.name), mono)):
                         self._last_send_mono = mono
+                        self._count_frame(mono)
                 elif need_heartbeat:
                     if self.device.heartbeat():
                         self._last_send_mono = mono
@@ -1228,21 +1537,31 @@ def _default_pages():
     names.sort(key=lambda n: (WIDGET_REGISTRY[n].priority, n))
     return names
 
-def _base_default_config():
+def _device_default(dev_id="dev1", port="auto"):
     return {
-        "port": "auto",
+        "id": dev_id,
+        "port": port,
         "pages": _default_pages(),
         "current_page": "",
         "orientation": "landscape",
         "reverse": False,
         "portrait_rotate": -90,
+        "background": {"enabled": False, "path": "", "mode": "fit",
+                       "dim": 0, "blur": 0, "paths": []},
+        "touch": dict(_TOUCH_DEFAULTS),
+    }
+
+
+def _base_default_config():
+    return {
+        "devices": [_device_default()],
         "gif_dir": str(DEFAULT_GIF_DIR),
-        "background": {"enabled": False, "path": "", "mode": "fit"},
         "widget_config": {},
         "font": "",
         "web": {"host": "0.0.0.0", "port": 8765},
         "log_level": "INFO",
-        "touch": dict(_TOUCH_DEFAULTS),
+        "schedules": [],
+        "hotkeys": False,
     }
 
 def _widget_meta():
@@ -1275,30 +1594,127 @@ def _deep_fill(default, user):
             out[k] = _deep_fill(dv, uv) if isinstance(uv, dict) else dict(dv)
     return out
 
-def _sanitize_config(cfg):
-    cfg["port"] = str(cfg.get("port") or "auto")
+def _sanitize_touch(tk):
+    if not isinstance(tk, dict):
+        tk = {}
+    touch = {}
+    for k, dv in _TOUCH_DEFAULTS.items():
+        v = tk.get(k, dv)
+        if k == "threshold":
+            v = _coerce_int(v, TOUCH_DEFAULT_THRESHOLD, 5, 2000)
+        else:
+            v = v if isinstance(v, str) else ("" if v is None else str(v))
+            v = v.strip()
+        if k in ("single", "double", "long") and v not in _TOUCH_ACTIONS:
+            v = "passthrough"
+        touch[k] = v
+    return touch
+
+
+def _sanitize_device(dev, index):
+    if not isinstance(dev, dict):
+        dev = {}
+    out = _device_default("dev%d" % (index + 1))
+    dev_id = dev.get("id")
+    if isinstance(dev_id, str) and dev_id.strip():
+        out["id"] = dev_id.strip()[:32]
+    out["port"] = str(dev.get("port") or "auto")
+    raw_pages = dev.get("pages")
     pages = []
-    for name in cfg.get("pages") or []:
+    for name in raw_pages if isinstance(raw_pages, list) else []:
         if isinstance(name, str) and name in WIDGET_REGISTRY and name not in pages:
             pages.append(name)
-    cfg["pages"] = pages or _default_pages()
-    cur = cfg.get("current_page") or ""
-    if not isinstance(cur, str) or cur not in pages:
-        cur = ""
-    cfg["current_page"] = cur
-    if cfg.get("orientation") not in (LANDSCAPE, PORTRAIT):
-        cfg["orientation"] = LANDSCAPE
-    cfg["reverse"] = bool(cfg.get("reverse", False))
-    rotate = _coerce_int(cfg.get("portrait_rotate"), -90)
-    cfg["portrait_rotate"] = rotate if rotate in (90, -90) else -90
-    gif_dir = cfg.get("gif_dir")
-    cfg["gif_dir"] = gif_dir if isinstance(gif_dir, str) and gif_dir else str(DEFAULT_GIF_DIR)
-    bg = cfg.get("background")
+    out["pages"] = pages or _default_pages()
+    cur = dev.get("current_page") or ""
+    out["current_page"] = cur if isinstance(cur, str) and cur in out["pages"] else ""
+    if dev.get("orientation") in (LANDSCAPE, PORTRAIT):
+        out["orientation"] = dev["orientation"]
+    out["reverse"] = bool(dev.get("reverse", False))
+    rotate = _coerce_int(dev.get("portrait_rotate"), -90)
+    out["portrait_rotate"] = rotate if rotate in (90, -90) else -90
+    bg = dev.get("background")
     if not isinstance(bg, dict):
         bg = {}
-    cfg["background"] = {"enabled": bool(bg.get("enabled", False)),
-                         "path": str(bg.get("path") or ""),
-                         "mode": bg.get("mode") if bg.get("mode") in Background.MODES else "fit"}
+    paths = []
+    for p in bg.get("paths") if isinstance(bg.get("paths"), list) else []:
+        if isinstance(p, str) and p.strip():
+            paths.append(p.strip())
+    out["background"] = {
+        "enabled": bool(bg.get("enabled", False)),
+        "path": str(bg.get("path") or ""),
+        "paths": paths,
+        "mode": bg.get("mode") if bg.get("mode") in Background.MODES else "fit",
+        "dim": _coerce_int(bg.get("dim"), 0, 0, 90),
+        "blur": _coerce_int(bg.get("blur"), 0, 0, 12),
+    }
+    out["touch"] = _sanitize_touch(dev.get("touch"))
+    return out
+
+
+def _sanitize_devices(cfg):
+    raw = cfg.get("devices")
+    if not isinstance(raw, list) or not raw:
+        legacy = _device_default()
+        for key in ("port", "pages", "current_page", "orientation", "reverse",
+                    "portrait_rotate", "background", "touch"):
+            if key in cfg:
+                legacy[key] = cfg[key]
+        raw = [legacy]
+    devices = []
+    seen_ids = set()
+    for i, dev in enumerate(raw[:8]):
+        item = _sanitize_device(dev, i)
+        base_id = item["id"]
+        n = 2
+        while item["id"] in seen_ids:
+            item["id"] = "%s-%d" % (base_id, n)
+            n += 1
+        seen_ids.add(item["id"])
+        devices.append(item)
+    for key in ("port", "pages", "current_page", "orientation", "reverse",
+                "portrait_rotate", "background", "touch"):
+        cfg.pop(key, None)
+    cfg["devices"] = devices
+    return devices
+
+
+def _sanitize_schedules(items):
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        at = it.get("at")
+        if not isinstance(at, str):
+            continue
+        parts = at.strip().split(":")
+        if len(parts) != 2:
+            continue
+        try:
+            hh, mm = int(parts[0]), int(parts[1])
+        except Exception:
+            continue
+        if not (0 <= hh <= 23 and 0 <= mm <= 59):
+            continue
+        action = it.get("action")
+        if not isinstance(action, str):
+            continue
+        url = action.strip()
+        if not url:
+            continue
+        days = it.get("days")
+        if isinstance(days, list):
+            days = [d for d in (_coerce_int(x, -1) for x in days) if 0 <= d <= 6]
+        else:
+            days = []
+        out.append({"at": "%02d:%02d" % (hh, mm), "action": url[:120],
+                    "days": days})
+    return out[:32]
+
+
+def _sanitize_config(cfg):
+    gif_dir = cfg.get("gif_dir")
+    cfg["gif_dir"] = gif_dir if isinstance(gif_dir, str) and gif_dir else str(DEFAULT_GIF_DIR)
+    _sanitize_devices(cfg)
     wc = cfg.get("widget_config")
     if not isinstance(wc, dict):
         wc = {}
@@ -1315,21 +1731,8 @@ def _sanitize_config(cfg):
     lvl = str(cfg.get("log_level") or "INFO").upper()
     cfg["log_level"] = lvl if lvl in ("DEBUG", "INFO", "WARNING", "ERROR",
                                       "CRITICAL") else "INFO"
-    tk = cfg.get("touch")
-    if not isinstance(tk, dict):
-        tk = {}
-    touch = {}
-    for k, dv in _TOUCH_DEFAULTS.items():
-        v = tk.get(k, dv)
-        if k == "threshold":
-            v = _coerce_int(v, TOUCH_DEFAULT_THRESHOLD, 5, 2000)
-        else:
-            v = v if isinstance(v, str) else ("" if v is None else str(v))
-            v = v.strip()
-        if k in ("single", "double", "long") and v not in _TOUCH_ACTIONS:
-            v = "passthrough"
-        touch[k] = v
-    cfg["touch"] = touch
+    cfg["schedules"] = _sanitize_schedules(cfg.get("schedules"))
+    cfg["hotkeys"] = bool(cfg.get("hotkeys", False))
     return cfg
 
 def _write_config_raw(cfg, path):
@@ -1508,12 +1911,31 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 .touch-row input[type=text] { width: 100%; }
 .touch-row .lbl { font-size: 13px; color: #444; }
 .hint { font-size: 11px; color: #888; margin: 4px 0 8px; }
+.thumb { width: 48px; height: 24px; border: 1px solid #ccc; border-radius: 2px;
+         vertical-align: middle; margin-right: 6px; image-rendering: pixelated; }
 </style>
 </head>
 <body>
 
 <h1>MSU2_MINI_Console</h1>
 <h3>本项目开源，采用 PolyForm Noncommercial License 1.0.0 </h3>
+
+<div class="card">
+  <h2>设备</h2>
+  <label style="font-size:13px">当前设备
+    <select id="dev-select" onchange="selectDevice()"></select>
+  </label>
+  <span class="msg" id="msg-dev"></span>
+  <div class="tiny" id="dev-info"></div>
+</div>
+
+<div class="card">
+  <h2>通知</h2>
+  <input type="text" id="notify-text" placeholder="推送到屏幕上的文字" style="width:22em">
+  <input type="number" id="notify-secs" value="5" min="1" max="60" style="width:4em"> 秒
+  <button onclick="sendNotify()">推送</button>
+  <span class="msg" id="msg-notify"></span>
+</div>
 
 <div class="card">
   <h2>显示控制</h2>
@@ -1583,12 +2005,26 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
     <input type="text" id="bg-path" placeholder="path/to/image.gif|png|jpg" style="width:22em">
   </div>
   <div style="margin-top:4px">
+    <textarea id="bg-paths" rows="3" style="width:100%"
+      placeholder="多张背景：一行一个路径，每 12 秒轮播一张"></textarea>
+  </div>
+  <div style="margin-top:4px">
     <label style="font-size:12px;color:#666">显示方式
       <select id="bg-mode" onchange="setBackgroundMode()">
         <option value="fit">适应</option>
         <option value="fill">填充</option>
         <option value="stretch">拉伸</option>
       </select>
+    </label>
+    <label style="font-size:12px;color:#666;margin-left:12px">暗化
+      <input type="range" id="bg-dim" min="0" max="90" step="5" value="0"
+             oninput="setBgDimLabel()" onchange="applyBgLook()">
+      <span id="bg-dim-v" class="tiny">0%</span>
+    </label>
+    <label style="font-size:12px;color:#666;margin-left:12px">模糊
+      <input type="range" id="bg-blur" min="0" max="12" step="1" value="0"
+             oninput="setBgBlurLabel()" onchange="applyBgLook()">
+      <span id="bg-blur-v" class="tiny">0</span>
     </label>
   </div>
   <div style="margin-top:4px">
@@ -1598,7 +2034,18 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 </div>
 
 <div class="card">
+  <h2>定时任务</h2>
+  <div class="tiny">每行一条，格式 <code>HH:MM|动作</code>，动作可写 next_page / prev_page / flip / toggle_orientation / screenshot / mute_toggle / blank / shutdown</div>
+  <textarea id="sched-text" rows="4" style="width:100%"></textarea>
+  <div style="margin-top:4px">
+    <button onclick="saveSchedules()">保存定时任务</button>
+    <span class="msg" id="msg-sched"></span>
+  </div>
+</div>
+
+<div class="card">
   <h2>状态</h2>
+  <div class="tiny" id="metrics-line"></div>
   <pre id="status">加载中...</pre>
 </div>
 
@@ -1732,6 +2179,95 @@ function setMsg(id, text, isErr) {
   el.classList.toggle('err', !!isErr);
 }
 
+async function loadDevices() {
+  try {
+    const j = await getJSON('/api/devices');
+    const sel = document.getElementById('dev-select');
+    const active = j.active || '';
+    sel.innerHTML = '';
+    (j.devices || []).forEach(d => {
+      const o = document.createElement('option');
+      o.value = d.id;
+      o.textContent = `${d.id}  ${d.port || 'auto'}  ${d.connected ? '已连接' : '未连接'}  ${d.current || ''}`;
+      sel.appendChild(o);
+    });
+    if (active) sel.value = active;
+    const info = (j.devices || []).map(d =>
+      `${d.id}: ${d.port || 'auto'} ${d.connected ? 'OK' : '--'} ${d.current || ''} (${d.pages} 页)`
+    ).join('   ·   ');
+    document.getElementById('dev-info').textContent = info;
+  } catch(e) {}
+}
+
+async function selectDevice() {
+  const id = document.getElementById('dev-select').value;
+  const j = await postJSON('/api/select', { id });
+  document.getElementById('msg-dev').textContent = j.ok ? '已切换' : (j.err || '失败');
+  if (j.ok) {
+    await refresh();
+    await loadPages();
+  }
+}
+
+async function sendNotify() {
+  const text = document.getElementById('notify-text').value;
+  const secs = parseInt(document.getElementById('notify-secs').value || '5', 10);
+  const j = await postJSON('/api/notify', { text, secs });
+  document.getElementById('msg-notify').textContent =
+    j.ok ? '已推送' : (j.err || '失败');
+}
+
+function setBgDimLabel() {
+  document.getElementById('bg-dim-v').textContent =
+    document.getElementById('bg-dim').value + '%';
+}
+
+function setBgBlurLabel() {
+  document.getElementById('bg-blur-v').textContent =
+    document.getElementById('bg-blur').value;
+}
+
+async function applyBgLook() {
+  const dim = parseInt(document.getElementById('bg-dim').value, 10);
+  const blur = parseInt(document.getElementById('bg-blur').value, 10);
+  const j = await postJSON('/api/background', {
+    enabled: allBgEnabled,
+    path: document.getElementById('bg-path').value.trim(),
+    paths: bgPaths(),
+    mode: document.getElementById('bg-mode').value,
+    dim, blur,
+  });
+  document.getElementById('msg-bg').textContent =
+    j.ok ? `暗化 ${j.dim}% 模糊 ${j.blur}` : (j.err || '失败');
+}
+
+function bgPaths() {
+  return document.getElementById('bg-paths').value
+    .split('\n').map(s => s.trim()).filter(s => s.length > 0);
+}
+
+async function loadSchedules() {
+  try {
+    const j = await getJSON('/api/schedules');
+    const lines = (j.schedules || []).map(s => `${s.at}|${s.action}`);
+    document.getElementById('sched-text').value = lines.join('\n');
+  } catch(e) {}
+}
+
+async function saveSchedules() {
+  const items = [];
+  document.getElementById('sched-text').value.split('\n').forEach(line => {
+    const t = line.trim();
+    if (!t) return;
+    const p = t.split('|');
+    if (p.length < 2) return;
+    items.push({ at: p[0].trim(), action: p[1].trim() });
+  });
+  const j = await postJSON('/api/schedules', { schedules: items });
+  document.getElementById('msg-sched').textContent =
+    j.ok ? `已保存 ${(j.schedules || []).length} 条` : (j.err || '失败');
+}
+
 async function refresh() {
   try {
     const j = await getJSON('/api/status');
@@ -1751,6 +2287,37 @@ async function refresh() {
     const bgModeEl = document.getElementById('bg-mode');
     if (bgModeEl && document.activeElement !== bgModeEl) {
       bgModeEl.value = j.background_mode || 'fit';
+    }
+    const dimEl = document.getElementById('bg-dim');
+    if (dimEl && document.activeElement !== dimEl) {
+      dimEl.value = j.background_dim || 0;
+      setBgDimLabel();
+    }
+    const blurEl = document.getElementById('bg-blur');
+    if (blurEl && document.activeElement !== blurEl) {
+      blurEl.value = j.background_blur || 0;
+      setBgBlurLabel();
+    }
+    const pathsEl = document.getElementById('bg-paths');
+    if (pathsEl && document.activeElement !== pathsEl) {
+      const cur = (j.background_paths || []).join('\n');
+      if (pathsEl.value.trim() !== cur.trim()) pathsEl.value = cur;
+    }
+    const sel = document.getElementById('dev-select');
+    if (sel && j.active && document.activeElement !== sel) {
+      sel.value = j.active;
+    }
+    const info = (j.devices || []).map(d =>
+      `${d.id}: ${d.port || 'auto'} ${d.connected ? 'OK' : '--'} ${d.current || ''} (${d.pages} 页)`
+    ).join('   ·   ');
+    document.getElementById('dev-info').textContent = info;
+    const m = j.metrics || {};
+    if (m.fps !== undefined) {
+      const rk = Object.keys(m.render_ms || {})
+        .map(k => `${k} ${m.render_ms[k]}ms`).join('  ');
+      document.getElementById('metrics-line').textContent =
+        `FPS ${m.fps}   吞吐 ${m.bytes_per_sec} B/s   帧 ${m.frames}   ` +
+        `重连 ${m.reconnects}   渲染 ${rk}`;
     }
     syncTouchSelects(j.touch || {});
 
@@ -1830,6 +2397,7 @@ function renderPages() {
       `<button class="mini" onclick="moveUp(${i})" ${i===0?'disabled':''}>↑</button>` +
       `<button class="mini" onclick="moveDown(${i})" ${i===currentPages.length-1?'disabled':''}>↓</button>` +
       `<button class="mini" onclick="removeAt(${i})">×</button>` +
+      `<img class="thumb" src="/api/preview?name=${encodeURIComponent(name)}&t=${Date.now()}" alt="">` +
       cfgBtn +
       nameTag +
       actBtn +
@@ -2131,6 +2699,18 @@ function closeConfig() {
   document.getElementById('config-panel').style.display = 'none';
 }
 
+async function postJSON(path, body) {
+  try {
+    return await getJSON(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {}),
+    });
+  } catch(e) {
+    return {ok: false, err: String(e)};
+  }
+}
+
 async function post(path) {
   try {
     const j = await getJSON(path, {method:'POST'});
@@ -2149,8 +2729,11 @@ async function toggleBackground() {
   const path = document.getElementById('bg-path').value.trim();
   const modeEl = document.getElementById('bg-mode');
   const mode = modeEl ? modeEl.value : 'fit';
+  const paths = bgPaths();
+  const dim = parseInt(document.getElementById('bg-dim').value, 10);
+  const blur = parseInt(document.getElementById('bg-blur').value, 10);
 
-  if (next && !path) {
+  if (next && !path && paths.length === 0) {
     setMsg('msg-bg', '请先填写图片路径', true);
     return;
   }
@@ -2159,7 +2742,7 @@ async function toggleBackground() {
     const j = await getJSON('/api/background', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({enabled: next, path, mode})
+      body: JSON.stringify({enabled: next, path, paths, mode, dim, blur})
     });
     if (j.ok) setMsg('msg-bg', next ? '已启用' : '已关闭', false);
     else setMsg('msg-bg', j.err || '被拒绝', true);
@@ -2202,9 +2785,12 @@ async function shutdownApp() {
 }
 
 loadTouch();
+loadDevices();
+loadSchedules();
 loadPages();
 refresh();
 setInterval(refresh, 1000);
+setInterval(loadDevices, 5000);
 </script>
 </body>
 </html>
@@ -2250,10 +2836,133 @@ def _check_widget_values(schema, values):
             return False, "%s: %s" % (label, err)
     return True, ""
 
+def _pick_free_port(used):
+    try:
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+    except Exception:
+        return ""
+    for name in ports:
+        if name in used:
+            continue
+        probe = MiniDevice(name)
+        ok = False
+        try:
+            ok = probe.open()
+        except Exception:
+            ok = False
+        finally:
+            probe.close()
+        if ok:
+            return name
+    return ""
+
+class OfflineDevice:
+    def __init__(self):
+        self.port = "offline"
+        self.connected = True
+        self.last = None
+        self.frames = 0
+        self.transport = type("T", (), {"bytes_written": 0})()
+
+    def open(self):
+        self.connected = True
+        return True
+
+    def close(self):
+        self.connected = False
+
+    def show_image(self, img):
+        self.last = img.copy()
+        self.frames += 1
+        self.transport.bytes_written += img.size[0] * img.size[1] * 2
+        return True
+
+    def set_reverse(self, reverse):
+        pass
+
+    def read_touch(self):
+        return 0
+
+    def heartbeat(self):
+        return True
+
+class DeviceManager:
+    def __init__(self, cfg, cfg_path, offline=False):
+        self.cfg = cfg
+        self.cfg_path = cfg_path
+        self.offline = bool(offline)
+        self.lock = threading.RLock()
+        self.schedulers = {}
+        self.order = []
+        self.active_id = None
+        self._build()
+
+    def _build(self):
+        items = self.cfg.get("devices") or []
+        used = set()
+        for i, dev in enumerate(items):
+            if not isinstance(dev, dict):
+                continue
+            did = str(dev.get("id") or ("dev%d" % (i + 1)))
+            port = str(dev.get("port") or "auto")
+            if port.lower() in ("auto", ""):
+                port = _pick_free_port(used) or ""
+            if port:
+                used.add(port)
+            device = OfflineDevice() if self.offline else MiniDevice(port or "auto")
+            sched = Scheduler(device, dev, on_config_changed=self._persist,
+                              shared=self.cfg)
+            self.schedulers[did] = sched
+            self.order.append(did)
+        if self.order:
+            self.active_id = self.order[0]
+
+    def _persist(self):
+        try:
+            save_config(self.cfg, self.cfg_path)
+        except Exception as e:
+            log.warning("保存配置失败: %s", e)
+
+    def start(self):
+        for did in self.order:
+            self.schedulers[did].start()
+
+    def stop(self):
+        for did in self.order:
+            self.schedulers[did].stop()
+        for did in self.order:
+            try:
+                self.schedulers[did].join(timeout=3.0)
+            except Exception:
+                pass
+
+    def active(self):
+        with self.lock:
+            return self.schedulers.get(self.active_id)
+
+    def select(self, did):
+        with self.lock:
+            if did not in self.schedulers:
+                return False
+            self.active_id = did
+            return True
+
+    def describe(self):
+        out = []
+        for did in self.order:
+            s = self.schedulers[did]
+            widgets = s._widgets
+            cur = s._current
+            name = widgets[cur].name if 0 <= cur < len(widgets) else None
+            out.append({"id": did, "port": s.device.port,
+                        "connected": s.device.connected,
+                        "current": name, "pages": len(widgets)})
+        return out
+
 class WebUI(threading.Thread):
-    def __init__(self, scheduler, cfg, cfg_path, on_shutdown=None):
+    def __init__(self, manager, cfg, cfg_path, on_shutdown=None):
         super().__init__(daemon=True, name="WebUI")
-        self.scheduler = scheduler
+        self.manager = manager
         self.cfg = cfg
         self.cfg_path = cfg_path
         self.on_shutdown = on_shutdown
@@ -2264,13 +2973,15 @@ class WebUI(threading.Thread):
         self.port = _coerce_int(web.get("port"), 8765, 1, 65535)
         self._stop = threading.Event()
 
+    @property
+    def scheduler(self):
+        return self.manager.active() if self.manager else None
+
     def stop(self):
         self._stop.set()
 
     def run(self):
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        sched = self.scheduler
-        cfg = self.cfg
         cfg_path = self.cfg_path
         outer = self
 
@@ -2309,6 +3020,57 @@ class WebUI(threading.Thread):
                     return {}
                 return obj if isinstance(obj, dict) else {}
 
+            def _dev(self):
+                sched = outer.manager.active()
+                if sched is None:
+                    return None, {}
+                return sched, sched.config
+
+            def _preview(self, name):
+                cls = WIDGET_REGISTRY.get(name)
+                if not cls:
+                    return None
+                sched, dcfg = self._dev()
+                orientation = sched.orientation if sched else LANDSCAPE
+                size = PORTRAIT_SIZE if orientation == PORTRAIT else LANDSCAPE_SIZE
+                ctx = RenderContext(device=None, now=time.time(),
+                                    orientation=orientation, state={},
+                                    config=dict(outer.cfg or {}))
+                inst = None
+                try:
+                    for w in (sched._widgets if sched else []):
+                        if w.name == name:
+                            inst = w
+                            ctx = sched._ctx_for(w)
+                            break
+                    own = inst is None
+                    if own:
+                        inst = cls()
+                        inst.setup(ctx)
+                    ctx.now = time.time()
+                    ctx.orientation = orientation
+                    img = inst.render(ctx)
+                except Exception as e:
+                    log.warning("缩略图渲染失败 %s: %s", name, e)
+                    img = None
+                finally:
+                    if inst is not None and own:
+                        try:
+                            inst.teardown(ctx)
+                        except Exception:
+                            pass
+                if img is None:
+                    img = Image.new("RGBA", size, (0, 0, 0, 255))
+                if img.size != size:
+                    img = img.resize(size, Image.LANCZOS)
+                if img.mode != "RGBA":
+                    img = img.convert("RGBA")
+                bg = Image.new("RGBA", size, (0, 0, 0, 255))
+                bg.alpha_composite(img)
+                buf = io.BytesIO()
+                bg.convert("RGB").save(buf, format="PNG")
+                return buf.getvalue()
+
             def do_GET(self):
                 parsed = urlparse(self.path)
                 path = parsed.path
@@ -2316,13 +3078,30 @@ class WebUI(threading.Thread):
                 if path in ("/", "/index.html"):
                     self._html(INDEX_HTML); return
 
+                if path == "/api/devices":
+                    self._json({"ok": True,
+                                "active": outer.manager.active_id,
+                                "devices": outer.manager.describe()}); return
+
+                sched, dcfg = self._dev()
+
                 if path == "/api/status":
+                    if sched is None:
+                        self._json({"connected": False, "port": "",
+                                    "current_widget": None, "widgets": [],
+                                    "orientation": LANDSCAPE, "reverse": False,
+                                    "locked": False, "active": None,
+                                    "devices": [], "touch": dict(_TOUCH_DEFAULTS)})
+                        return
                     widgets = sched._widgets
                     cur = sched._current
                     cur_name = widgets[cur].name if 0 <= cur < len(widgets) else None
                     self._json({
                         "connected": sched.device.connected,
                         "port": sched.device.port,
+                        "device": str(dcfg.get("id") or ""),
+                        "active": outer.manager.active_id,
+                        "devices": outer.manager.describe(),
                         "current_widget": cur_name,
                         "widgets": [w.name for w in widgets],
                         "orientation": sched.orientation,
@@ -2330,9 +3109,34 @@ class WebUI(threading.Thread):
                         "locked": sched._locked,
                         "background_enabled": sched._bg_enabled,
                         "background_path": sched._bg_path,
+                        "background_paths": list(sched._bg_paths),
                         "background_mode": sched._bg_mode,
+                        "background_dim": sched._bg_dim,
+                        "background_blur": sched._bg_blur,
                         "touch": dict(sched._touch_cfg),
+                        "metrics": sched.metrics_snapshot(),
                     }); return
+
+                if path == "/api/metrics":
+                    if sched is None:
+                        self._json({"ok": False, "err": "没有可用设备"}); return
+                    data = sched.metrics_snapshot()
+                    data["ok"] = True
+                    data["port"] = sched.device.port
+                    self._json(data); return
+
+                if path == "/api/schedules":
+                    self._json({"ok": True,
+                                "schedules": list(outer.cfg.get("schedules") or [])})
+                    return
+
+                if path == "/api/preview":
+                    q = parse_qs(parsed.query)
+                    name = (q.get("name") or [""])[0]
+                    data = self._preview(name)
+                    if data is None:
+                        self.send_error(404); return
+                    self._send(data, "image/png"); return
 
                 if path == "/api/widgets":
                     self._json({
@@ -2348,7 +3152,7 @@ class WebUI(threading.Thread):
                              "source": "external" if str(getattr(c, "__module__", "")).startswith("msu2_ext_widgets") else "builtin"}
                             for n, c in sorted(WIDGET_REGISTRY.items())
                         ],
-                        "active": cfg.get("pages", []),
+                        "active": list(dcfg.get("pages") or []),
                     }); return
 
                 if path == "/api/widget_config":
@@ -2358,12 +3162,12 @@ class WebUI(threading.Thread):
                     if not cls:
                         self._json({"ok": False, "err": "未知插件"}); return
                     obj = cls
-                    for w in sched._widgets:
+                    for w in (sched._widgets if sched else []):
                         if w.name == name:
                             obj = w
                             break
                     schema = getattr(obj, "config_schema", [])
-                    user = cfg.get("widget_config", {}).get(name, {})
+                    user = outer.cfg.get("widget_config", {}).get(name, {})
                     values = merge_config(schema, user)
                     self._json({
                         "ok": True, "name": name,
@@ -2374,7 +3178,7 @@ class WebUI(threading.Thread):
                     }); return
 
                 if path == "/api/touch_config":
-                    tk = cfg.get("touch", {}) or {}
+                    tk = dcfg.get("touch", {}) or {}
                     vals = {}
                     for k, dv in _TOUCH_DEFAULTS.items():
                         vals[k] = tk.get(k, dv)
@@ -2384,7 +3188,25 @@ class WebUI(threading.Thread):
 
             def do_POST(self):
                 try:
-                    if self.path == "/api/next":
+                    sched, dcfg = self._dev()
+                    if self.path == "/api/select":
+                        body = self._read_json()
+                        did = str(body.get("id", ""))
+                        ok = outer.manager.select(did)
+                        self._json({"ok": ok, "active": outer.manager.active_id,
+                                    "err": "" if ok else "设备不存在"})
+                    elif self.path == "/api/schedules":
+                        body = self._read_json()
+                        items = body.get("schedules", [])
+                        outer.cfg["schedules"] = _sanitize_schedules(items)
+                        save_config(outer.cfg, cfg_path)
+                        for s in outer.manager.schedulers.values():
+                            s._schedule_seen.clear()
+                        self._json({"ok": True,
+                                    "schedules": outer.cfg["schedules"]})
+                    elif sched is None:
+                        self._json({"ok": False, "err": "没有可用设备"})
+                    elif self.path == "/api/next":
                         ok = sched.next_page()
                         self._json({"ok": ok, "err": "" if ok else "冷却中"})
                     elif self.path == "/api/prev":
@@ -2392,18 +3214,24 @@ class WebUI(threading.Thread):
                         self._json({"ok": ok, "err": "" if ok else "冷却中"})
                     elif self.path == "/api/reload":
                         sched.reload(); self._json({"ok": True})
+                    elif self.path == "/api/notify":
+                        body = self._read_json()
+                        text = str(body.get("text", ""))
+                        secs = body.get("secs", 5)
+                        ok = sched.notify(text, secs)
+                        self._json({"ok": ok, "err": "" if ok else "内容为空"})
                     elif self.path == "/api/reverse":
                         ok = sched.toggle_reverse()
                         if ok:
-                            cfg["reverse"] = sched.reverse
-                            save_config(cfg, cfg_path)
+                            dcfg["reverse"] = sched.reverse
+                            save_config(outer.cfg, cfg_path)
                         self._json({"ok": ok, "reverse": sched.reverse,
                                     "err": "" if ok else "冷却中"})
                     elif self.path == "/api/orientation":
                         ok = sched.toggle_orientation()
                         if ok:
-                            cfg["orientation"] = sched.orientation
-                            save_config(cfg, cfg_path)
+                            dcfg["orientation"] = sched.orientation
+                            save_config(outer.cfg, cfg_path)
                         self._json({"ok": ok, "orientation": sched.orientation,
                                     "err": "" if ok else "冷却中"})
                     elif self.path == "/api/pages":
@@ -2411,8 +3239,8 @@ class WebUI(threading.Thread):
                         pages = [p for p in body.get("pages", [])
                                  if p in WIDGET_REGISTRY]
                         applied = sched.set_pages(pages)
-                        cfg["pages"] = applied
-                        save_config(cfg, cfg_path)
+                        dcfg["pages"] = applied
+                        save_config(outer.cfg, cfg_path)
                         self._json({"ok": True, "pages": applied, "err": ""})
                     elif self.path == "/api/background":
                         body = self._read_json()
@@ -2421,26 +3249,44 @@ class WebUI(threading.Thread):
                         mode = body.get("mode")
                         if mode not in Background.MODES:
                             mode = None
-                        if not enabled and not path:
-                            bg = cfg.get("background")
-                            path = (bg or {}).get("path", "") if isinstance(bg, dict) else ""
+                        paths = body.get("paths")
+                        if paths is not None and not isinstance(paths, list):
+                            paths = None
+                        if paths is not None:
+                            paths = [str(p) for p in paths if isinstance(p, str)]
+                        dim = body.get("dim")
+                        blur = body.get("blur")
+                        bg = dcfg.get("background")
+                        if not isinstance(bg, dict):
+                            bg = {}
+                            dcfg["background"] = bg
+                        if not enabled and not path and not paths:
+                            path = str(bg.get("path", "") or "")
                         if path:
                             vok, verr = _check_path(path, IMAGE_EXTS,
                                                     MAX_RESOURCE_BYTES)
                             if not vok:
                                 self._json({"ok": False, "err": verr}); return
-                        sched.set_background(enabled, path, mode)
-                        bgcfg = cfg.get("background")
-                        if not isinstance(bgcfg, dict):
-                            bgcfg = {}
-                            cfg["background"] = bgcfg
-                        bgcfg["enabled"] = enabled
-                        bgcfg["path"] = path
+                        for item in paths or []:
+                            vok, verr = _check_path(item, IMAGE_EXTS,
+                                                    MAX_RESOURCE_BYTES)
+                            if not vok:
+                                self._json({"ok": False, "err": verr}); return
+                        sched.set_background(enabled, path, mode, paths, dim, blur)
+                        bg["enabled"] = enabled
+                        bg["path"] = path
+                        if paths is not None:
+                            bg["paths"] = paths
                         if mode:
-                            bgcfg["mode"] = mode
-                        save_config(cfg, cfg_path)
+                            bg["mode"] = mode
+                        bg["dim"] = sched._bg_dim
+                        bg["blur"] = sched._bg_blur
+                        save_config(outer.cfg, cfg_path)
                         self._json({"ok": True, "enabled": enabled, "path": path,
-                                    "mode": bgcfg.get("mode", "fit")})
+                                    "paths": list(sched._bg_paths),
+                                    "mode": bg.get("mode", "fit"),
+                                    "dim": sched._bg_dim,
+                                    "blur": sched._bg_blur})
                     elif self.path == "/api/switch":
                         body = self._read_json()
                         name = str(body.get("name", ""))
@@ -2462,10 +3308,11 @@ class WebUI(threading.Thread):
                         vok, verr = _check_widget_values(schema, merged)
                         if not vok:
                             self._json({"ok": False, "err": verr}); return
-                        cfg.setdefault("widget_config", {})
-                        cfg["widget_config"][name] = merged
-                        save_config(cfg, cfg_path)
-                        sched.restart_widget(name)
+                        outer.cfg.setdefault("widget_config", {})
+                        outer.cfg["widget_config"][name] = merged
+                        save_config(outer.cfg, cfg_path)
+                        for s in outer.manager.schedulers.values():
+                            s.restart_widget(name)
                         self._json({"ok": True, "values": merged})
                     elif self.path == "/api/widget_action":
                         body = self._read_json()
@@ -2491,7 +3338,7 @@ class WebUI(threading.Thread):
                         values = body.get("values", {}) or {}
                         try:
                             sched.set_touch_config(values)
-                            save_config(cfg, cfg_path)
+                            save_config(outer.cfg, cfg_path)
                             self._json({"ok": True, "values": sched._touch_cfg})
                         except Exception as e:
                             log.exception("保存触控配置失败")
@@ -2524,6 +3371,133 @@ class WebUI(threading.Thread):
             srv.server_close()
         except Exception as e:
             log.warning("Web UI 启动失败: %s", e)
+
+_NEW_WIDGET_TEMPLATE = '''from PIL import Image, ImageDraw
+
+from msu2_core import BOTH, Field, Widget, get_font
+
+
+class {cls}(Widget):
+    name = "{name}"
+    interval = 1.0
+    orientations = BOTH
+    priority = 200
+
+    actions = {{}}
+    touch_help = ""
+
+    config_schema = [
+        Field("title", "str", "标题", default="{name}"),
+    ]
+
+    def render(self, ctx):
+        cfg = self.get_config(ctx)
+        w, h = ctx.size
+        img = Image.new("RGBA", (w, h), (18, 20, 26, 255))
+        d = ImageDraw.Draw(img)
+        f1 = get_font(12, bold=True, cjk=True)
+        f2 = get_font(9, cjk=True)
+        d.text((8, h // 2 - 12), str(cfg.get("title") or self.name),
+               font=f1, fill=(240, 244, 255, 255))
+        d.text((8, h // 2 + 4), "%.1f" % ctx.now, font=f2,
+               fill=(140, 160, 200, 255))
+        return img
+'''
+
+
+def _widget_class_name(name):
+    parts = [p for p in str(name).replace("-", "_").split("_") if p]
+    base = "".join(p[:1].upper() + p[1:] for p in parts) or "New"
+    if base.endswith("Widget"):
+        return base
+    return base + "Widget"
+
+
+def cmd_new_widget(name):
+    raw = str(name or "").strip()
+    if not raw:
+        _console("请提供一个插件名，例如 --new-widget my_clock")
+        return 1
+    slug = "".join(c if (c.isalnum() or c == "_") else "_" for c in raw).strip("_")
+    if not slug:
+        _console("插件名只能包含字母、数字和下划线")
+        return 1
+    if slug[0].isdigit():
+        slug = "w_" + slug
+    ext_dirs = []
+    try:
+        ext_dirs = list(getattr(_widgets_pkg, "_ext_dirs", []) or [])
+    except Exception:
+        ext_dirs = []
+    target_dir = Path(ext_dirs[0]) if ext_dirs else (Path(_APP_DIR) / "widgets_ext")
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        _console("无法创建目录 %s: %s" % (target_dir, e))
+        return 1
+    path = target_dir / (slug + ".py")
+    if path.exists():
+        _console("文件已存在: %s" % path)
+        return 1
+    body = _NEW_WIDGET_TEMPLATE.format(cls=_widget_class_name(slug), name=slug)
+    try:
+        path.write_text(body, encoding="utf-8")
+    except Exception as e:
+        _console("写入失败: %s" % e)
+        return 1
+    _console("已生成插件: %s" % path)
+    _console("放到该目录后重启程序（或等 2 秒热重载），即可在 Web 页面的“已停用”里找到它")
+    return 0
+
+
+def _start_hotkeys(manager):
+    try:
+        from pynput import keyboard
+    except Exception as e:
+        log.warning("全局热键不可用（缺少 pynput）: %s", e)
+        return None
+
+    def act(fn):
+        def _run():
+            try:
+                fn()
+            except Exception as e:
+                log.warning("热键动作失败: %s", e)
+        return _run
+
+    def _sched():
+        return manager.active()
+
+    def _next():
+        s = _sched()
+        if s: s.next_page()
+
+    def _prev():
+        s = _sched()
+        if s: s.prev_page()
+
+    def _shot():
+        threading.Thread(target=_act_screenshot, daemon=True).start()
+
+    def _notify():
+        s = _sched()
+        if s: s.notify("热键测试", 3)
+
+    try:
+        hk = keyboard.GlobalHotKeys({
+            "<ctrl>+<alt>+n": act(_next),
+            "<ctrl>+<alt>+p": act(_prev),
+            "<ctrl>+<alt>+s": act(_shot),
+            "<ctrl>+<alt>+m": act(_notify),
+        })
+        hk.daemon = True
+        hk.start()
+        log.info("全局热键已启用: Ctrl+Alt+N 下一页 / P 上一页 / S 截图 / M 通知")
+        return hk
+    except Exception as e:
+        log.warning("启动全局热键失败: %s", e)
+        return None
+
 
 def cmd_list():
     ports = list(serial.tools.list_ports.comports())
@@ -2566,6 +3540,67 @@ def _setup_stdio():
             pass
 
 
+def run_offline_window(manager, stop_event):
+    try:
+        import tkinter as tk
+        from PIL import ImageTk
+    except Exception as e:
+        _console("离线模拟屏不可用（需要 tkinter 与 Pillow）: %s" % e)
+        return 1
+    root = tk.Tk()
+    root.title("MSU2_MINI 离线模拟屏")
+    root.resizable(False, False)
+    canvas = tk.Canvas(root, width=SCREEN_W * 3, height=SCREEN_H * 3,
+                       bg="black", highlightthickness=0, bd=0)
+    canvas.pack()
+    bar = tk.Frame(root)
+    bar.pack(fill="x")
+    holder = {"photo": None}
+
+    def act(fn):
+        def _run():
+            s = manager.active()
+            if s is not None:
+                fn(s)
+        return _run
+
+    tk.Button(bar, text="上一页", command=act(lambda s: s.prev_page())).pack(side="left")
+    tk.Button(bar, text="下一页", command=act(lambda s: s.next_page())).pack(side="left")
+    tk.Button(bar, text="切换朝向",
+              command=act(lambda s: s.toggle_orientation())).pack(side="left")
+    tk.Button(bar, text="上下翻转",
+              command=act(lambda s: s.toggle_reverse())).pack(side="left")
+    tk.Button(bar, text="关闭", command=stop_event.set).pack(side="right")
+
+    def tick():
+        sched = manager.active()
+        dev = getattr(sched, "device", None) if sched is not None else None
+        img = getattr(dev, "last", None) if dev is not None else None
+        if img is not None:
+            img = img.convert("RGB")
+            w, h = img.size
+            scale = 3
+            if (canvas.winfo_width(), canvas.winfo_height()) != (w * scale, h * scale):
+                canvas.config(width=w * scale, height=h * scale)
+            photo = ImageTk.PhotoImage(
+                img.resize((w * scale, h * scale), Image.NEAREST))
+            holder["photo"] = photo
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=photo)
+        if stop_event.is_set():
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return
+        root.after(60, tick)
+
+    root.protocol("WM_DELETE_WINDOW", stop_event.set)
+    root.after(60, tick)
+    root.mainloop()
+    return 0
+
+
 def main(argv=None):
     _setup_stdio()
     ap = argparse.ArgumentParser(description="MSU2_MINI_Console")
@@ -2573,6 +3608,10 @@ def main(argv=None):
     ap.add_argument("--init-config", action="store_true")
     ap.add_argument("--port")
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--new-widget", default=None,
+                    help="生成一个外挂插件骨架后退出")
+    ap.add_argument("--offline", action="store_true",
+                    help="不开串口，用窗口模拟屏幕")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--plugins", action="store_true",
                     help="列出所有已发现的插件后退出")
@@ -2585,6 +3624,8 @@ def main(argv=None):
         cmd_list(); return 0
     if args.plugins:
         cmd_plugins(); return 0
+    if args.new_widget:
+        return cmd_new_widget(args.new_widget)
 
     stream = sys.stderr
     if stream is None:
@@ -2642,17 +3683,10 @@ def main(argv=None):
         log.warning("外部插件加载失败 %d 个: %s", len(ext["failed"]),
                     ext["failed"])
 
-    port = args.port or cfg.get("port")
-    if not port or port == "auto":
-        log.info("自动扫描设备…")
-        device = discover_and_open()
-        if not device: return 2
-    else:
-        device = MiniDevice(port)
-        if not device.open():
-            log.error("无法打开 %s: %s",
-                      port, device.transport.last_error or "未知错误")
-            return 3
+    if args.port:
+        devs = cfg.get("devices") or []
+        if devs and isinstance(devs[0], dict):
+            devs[0]["port"] = args.port
 
     stop_event = threading.Event()
 
@@ -2667,14 +3701,23 @@ def main(argv=None):
             pass
         stop_event.set()
 
-    sched = Scheduler(device, cfg,
-                      on_config_changed=_save,
-                      on_shutdown=_request_shutdown)
-    sched.start()
+    manager = DeviceManager(cfg, cfg_path, offline=bool(args.offline))
+    if not manager.order:
+        log.error("配置里没有任何设备")
+        return 2
+    for did in manager.order:
+        s = manager.schedulers[did]
+        s._on_shutdown = _request_shutdown
+        log.info("设备 %s -> %s", did, s.device.port or "auto")
+    manager.start()
+
+    hotkeys = None
+    if cfg.get("hotkeys"):
+        hotkeys = _start_hotkeys(manager)
 
     web = None
     if not args.headless:
-        web = WebUI(sched, cfg, cfg_path, on_shutdown=_request_shutdown)
+        web = WebUI(manager, cfg, cfg_path, on_shutdown=_request_shutdown)
         web.start()
     else:
         log.info("无头模式: Ctrl+C 退出")
@@ -2687,19 +3730,21 @@ def main(argv=None):
         signal.signal(signal.SIGTERM, _sig)
 
     try:
+        if args.offline:
+            run_offline_window(manager, stop_event)
         while not stop_event.is_set():
             time.sleep(0.2)
     finally:
         log.info("正在退出…")
         try: _save()
         except Exception: pass
-        sched.stop()
+        manager.stop()
         if web: web.stop()
-        try:
-            sched.join(timeout=3.0)
-        except Exception:
-            pass
-        device.close()
+        for did in manager.order:
+            try:
+                manager.schedulers[did].device.close()
+            except Exception:
+                pass
     return 0
 
 if __name__ == "__main__":
