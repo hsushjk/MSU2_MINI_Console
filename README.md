@@ -16,6 +16,10 @@
 
 ![example1](./example/1.png)
 
+## 联动项目
+
+[MSU2_MINI_FW](https://github.com/hsushjk/MSU2_MINI_FW)，敬请期待
+
 ## 目录
 
 - [内置插件](#内置插件)
