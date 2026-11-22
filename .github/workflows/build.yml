@@ -30,7 +30,7 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
-          python -m pip install "pyserial>=3.5" "pillow>=10" "pyinstaller>=6.10"
+          python -m pip install "pyserial>=3.5" "pillow>=10" "pyinstaller>=6.10" "mss>=9.0" "pywin32>=306"
           if ("${{ matrix.arch }}" -eq "x86") {
             python -m pip install "psutil==7.1.1"
           } else {
@@ -108,7 +108,7 @@ jobs:
         shell: pwsh
         run: |
           & $env:PY_ARM64 -m pip install --upgrade pip
-          & $env:PY_ARM64 -m pip install "pyserial>=3.5" "pillow>=10" "psutil>=5.9" "pyinstaller>=6.10"
+          & $env:PY_ARM64 -m pip install "pyserial>=3.5" "pillow>=10" "psutil>=5.9" "pyinstaller>=6.10" "mss>=9.0" "pywin32>=306"
           & $env:PY_ARM64 -m pip install "numpy>=1.26" "pynput>=1.7.6"
           & $env:PY_ARM64 -c "import serial, PIL, psutil; print('deps ok')"
 

@@ -11,17 +11,19 @@ DATA_DIRS = ("msu2_core", "widgets", "assets")
 HIDDEN = (
     "serial",
     "serial.tools.list_ports",
-    "PIL",
-    "PIL.Image",
-    "PIL.ImageDraw",
-    "PIL.ImageFont",
-    "PIL.ImageOps",
     "psutil",
     "pynput",
     "pynput.keyboard",
     "pynput.mouse",
     "numpy",
+    "win32gui",
+    "win32ui",
+    "win32con",
+    "win32process",
+    "pywintypes",
+    "pythoncom",
 )
+COLLECT = ("msu2_core", "widgets", "PIL", "mss")
 
 
 def main(argv=None):
@@ -70,8 +72,13 @@ def main(argv=None):
         src = ROOT / name
         if src.is_dir():
             cmd += ["--add-data", "%s%s%s" % (src, SEP, name)]
-    for pkg in ("msu2_core", "widgets"):
-        cmd += ["--collect-submodules", pkg]
+    for pkg in COLLECT:
+        try:
+            found = importlib.util.find_spec(pkg) is not None
+        except (ImportError, ValueError):
+            found = False
+        if found:
+            cmd += ["--collect-submodules", pkg]
     for mod in HIDDEN:
         if args.no_numpy and mod == "numpy":
             cmd += ["--exclude-module", "numpy"]
