@@ -2006,6 +2006,7 @@ pre { background: #fff; border: 1px solid #ccc; padding: .6em;
 <div class="card">
   <h2>状态</h2>
   <div class="tiny" id="metrics-line"></div>
+  <div class="tiny" id="ext-line" style="color:#c0392b"></div>
   <pre id="status">加载中...</pre>
 </div>
 
@@ -2275,6 +2276,16 @@ async function refresh() {
       document.getElementById('metrics-line').textContent =
         `FPS ${m.fps}   吞吐 ${m.bytes_per_sec} B/s   帧 ${m.frames}   ` +
         `重连 ${m.reconnects}   渲染 ${rk}`;
+    }
+    const extEl = document.getElementById('ext-line');
+    if (extEl) {
+      const ef = j.ext_failed || [];
+      extEl.textContent = ef.length
+        ? `外部插件加载失败 ${ef.length} 个：` + ef.map(function (x) {
+            const p = String(x[0] || '').split(/[\\/]/).pop();
+            return p + '（' + (x[1] || '') + '）';
+          }).join('   ')
+        : '';
     }
     syncTouchSelects(j.touch || {});
     const pv = document.getElementById('dev-preview');
@@ -3109,7 +3120,13 @@ class WebUI(threading.Thread):
                     widgets = sched._widgets
                     cur = sched._current
                     cur_name = widgets[cur].name if 0 <= cur < len(widgets) else None
+                    try:
+                        _ext = _widgets_pkg.external_report()
+                    except Exception:
+                        _ext = {}
                     self._json({
+                        "ext_dirs": list(_ext.get("dirs") or []),
+                        "ext_failed": [list(x) for x in (_ext.get("failed") or [])],
                         "connected": sched.device.connected,
                         "port": sched.device.port,
                         "device": str(dcfg.get("id") or ""),
